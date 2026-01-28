@@ -1,4 +1,5 @@
-﻿const express = require("express");
+﻿// server.js
+const express = require("express");
 const bodyParser = require("body-parser");
 const WebSocket = require("ws");
 
@@ -10,6 +11,7 @@ const PORT = process.env.PORT || 3000;
 
 app.get("/", (req, res) => res.send("OK"));
 
+// Twilio Voice webhook -> starts Media Stream
 app.post("/voice", (req, res) => {
   const twiml = `
 <Response>
@@ -37,6 +39,7 @@ wss.on("connection", (twilioWs) => {
 
   let streamSid = null;
   let openaiReady = false;
+
   const pending = [];
   const MAX_PENDING = 200;
 
@@ -54,12 +57,11 @@ wss.on("connection", (twilioWs) => {
     console.log("OpenAI WS open");
     openaiReady = true;
 
+    // FIX 1: remove unsupported session.type and invalid output_modalities
     safeSend(openaiWs, {
       type: "session.update",
       session: {
-        type: "realtime",
         model: "gpt-realtime",
-        output_modalities: ["audio"],
         instructions: `
 You are a professional phone answering assistant for Allen.
 
@@ -71,41 +73,58 @@ Be concise and friendly.
 `,
         audio: {
           input: {
+            // Twilio Media Streams audio is G.711 u-law (PCMU) at 8kHz
             format: { type: "audio/pcmu", rate: 8000 },
-            turn_detection: { type: "semantic_vad" }
+            turn_detection: { type: "semantic_vad" },
           },
           output: {
+            // Send PCMU back so Twilio can play it
             format: { type: "audio/pcmu" },
-            voice: "marin"
-          }
-        }
+            voice: "marin",
+          },
+        },
       },
     });
 
+    // Flush any buffered audio frames
     while (pending.length) safeSend(openaiWs, pending.shift());
 
+    // FIX 2: modalities must be ["audio","text"] (audio-only is invalid)
     safeSend(openaiWs, {
       type: "response.create",
-      response: { modalities: ["audio"] }
+      response: { modalities: ["audio", "text"] },
     });
   });
 
   openaiWs.on("message", (raw) => {
     let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-    if (msg.type && (msg.type.includes("error") || msg.type.includes("session") || msg.type.includes("response"))) {
-      if (msg.type !== "response.output_audio.delta") {
-        console.log("OpenAI event:", msg.type);
-        if (msg.error) console.log("OpenAI error detail:", msg.error);
-      }
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
     }
 
-    if (msg.type === "response.output_audio.delta" && msg.delta && streamSid) {
+    // Helpful logging (won't spam audio deltas)
+    if (
+      msg.type &&
+      (msg.type.includes("error") || msg.type.includes("session") || msg.type.includes("response")) &&
+      msg.type !== "response.output_audio.delta" &&
+      msg.type !== "response.audio.delta"
+    ) {
+      console.log("OpenAI event:", msg.type);
+      if (msg.error) console.log("OpenAI error detail:", msg.error);
+    }
+
+    // FIX 3: handle both possible audio delta event names
+    const audioDelta =
+      (msg.type === "response.output_audio.delta" && msg.delta) ||
+      (msg.type === "response.audio.delta" && msg.delta);
+
+    if (audioDelta && streamSid) {
       safeSend(twilioWs, {
         event: "media",
         streamSid,
-        media: { payload: msg.delta },
+        media: { payload: audioDelta },
       });
     }
   });
@@ -115,7 +134,11 @@ Be concise and friendly.
 
   twilioWs.on("message", (raw) => {
     let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
 
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || null;
@@ -140,15 +163,24 @@ Be concise and friendly.
 
     if (msg.event === "stop") {
       console.log("Twilio stream stop");
-      try { openaiWs.close(); } catch {}
-      try { twilioWs.close(); } catch {}
+      try {
+        openaiWs.close();
+      } catch {}
+      try {
+        twilioWs.close();
+      } catch {}
     }
   });
 
   const cleanup = () => {
-    try { openaiWs.close(); } catch {}
-    try { twilioWs.close(); } catch {}
+    try {
+      openaiWs.close();
+    } catch {}
+    try {
+      twilioWs.close();
+    } catch {}
   };
+
   twilioWs.on("close", cleanup);
   twilioWs.on("error", cleanup);
 });

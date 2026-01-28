@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 3000;
 
 app.get("/", (req, res) => res.send("OK"));
 
+// Twilio Voice webhook -> starts Media Stream
 app.post("/voice", (req, res) => {
   const twiml = `
 <Response>
@@ -35,6 +36,7 @@ function safeSend(ws, obj) {
 wss.on("connection", (twilioWs) => {
   let streamSid = null;
   let openaiReady = false;
+
   const pending = [];
   const MAX_PENDING = 200;
 
@@ -75,7 +77,7 @@ Be concise and friendly.
 
     while (pending.length) safeSend(openaiWs, pending.shift());
 
-    // Have the agent greet first
+    // Make the assistant greet first
     safeSend(openaiWs, { type: "response.create" });
   });
 

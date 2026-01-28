@@ -57,11 +57,13 @@ wss.on("connection", (twilioWs) => {
     console.log("OpenAI WS open");
     openaiReady = true;
 
-    // FIX 1: remove unsupported session.type and invalid output_modalities
+    // Session config aligned with Realtime WebSocket docs:
+    // - session.update
+    // - session.input_audio_format / session.output_audio_format
+    // - session.turn_detection (VAD) :contentReference[oaicite:3]{index=3}
     safeSend(openaiWs, {
       type: "session.update",
       session: {
-        model: "gpt-realtime",
         instructions: `
 You are a professional phone answering assistant for Allen.
 
@@ -71,28 +73,27 @@ You are a professional phone answering assistant for Allen.
 - If asked to speak to Allen, say: "One moment please—I'll take a message and pass it along."
 Be concise and friendly.
 `,
-        audio: {
-          input: {
-            // Twilio Media Streams audio is G.711 u-law (PCMU) at 8kHz
-            format: { type: "audio/pcmu", rate: 8000 },
-            turn_detection: { type: "semantic_vad" },
-          },
-          output: {
-            // Send PCMU back so Twilio can play it
-            format: { type: "audio/pcmu" },
-            voice: "marin",
-          },
-        },
+        // Twilio Media Streams is mulaw/PCMU @ 8kHz :contentReference[oaicite:4]{index=4}
+        input_audio_format: "g711_ulaw",
+        output_audio_format: "g711_ulaw",
+
+        // Let the server decide when the caller stopped talking
+        turn_detection: { type: "server_vad" },
+
+        // Voice may vary by model/account; if unsupported you'll see an error in logs
+        voice: "alloy",
       },
     });
 
     // Flush any buffered audio frames
     while (pending.length) safeSend(openaiWs, pending.shift());
 
-    // FIX 2: modalities must be ["audio","text"] (audio-only is invalid)
+    // IMPORTANT FIX: use output_modalities (not modalities) :contentReference[oaicite:5]{index=5}
     safeSend(openaiWs, {
       type: "response.create",
-      response: { modalities: ["audio", "text"] },
+      response: {
+        output_modalities: ["audio", "text"],
+      },
     });
   });
 
@@ -104,28 +105,37 @@ Be concise and friendly.
       return;
     }
 
-    // Helpful logging (won't spam audio deltas)
+    // Log useful events (avoid spamming deltas)
     if (
       msg.type &&
-      (msg.type.includes("error") || msg.type.includes("session") || msg.type.includes("response")) &&
       msg.type !== "response.output_audio.delta" &&
-      msg.type !== "response.audio.delta"
+      msg.type !== "response.audio.delta" &&
+      msg.type !== "response.output_text.delta" &&
+      msg.type !== "response.output_audio_transcript.delta"
     ) {
-      console.log("OpenAI event:", msg.type);
-      if (msg.error) console.log("OpenAI error detail:", msg.error);
+      if (msg.type.includes("error") || msg.type.includes("session") || msg.type.includes("response")) {
+        console.log("OpenAI event:", msg.type);
+        if (msg.error) console.log("OpenAI error detail:", msg.error);
+      }
     }
 
-    // FIX 3: handle both possible audio delta event names
+    // Handle both possible audio delta event names (docs show output_audio.delta; some accounts emit audio.delta) :contentReference[oaicite:6]{index=6}
     const audioDelta =
       (msg.type === "response.output_audio.delta" && msg.delta) ||
       (msg.type === "response.audio.delta" && msg.delta);
 
     if (audioDelta && streamSid) {
+      // Twilio expects base64 mulaw payload :contentReference[oaicite:7]{index=7}
       safeSend(twilioWs, {
         event: "media",
         streamSid,
         media: { payload: audioDelta },
       });
+    }
+
+    // Extra debug: if text is coming but audio isn’t, this will show it
+    if (msg.type === "response.output_text.delta" && msg.delta) {
+      console.log("OpenAI text delta:", msg.delta);
     }
   });
 
@@ -150,6 +160,7 @@ Be concise and friendly.
       const payload = msg.media?.payload;
       if (!payload) return;
 
+      // Stream caller audio into OpenAI input buffer :contentReference[oaicite:8]{index=8}
       const evt = { type: "input_audio_buffer.append", audio: payload };
 
       if (!openaiReady) {
@@ -163,22 +174,14 @@ Be concise and friendly.
 
     if (msg.event === "stop") {
       console.log("Twilio stream stop");
-      try {
-        openaiWs.close();
-      } catch {}
-      try {
-        twilioWs.close();
-      } catch {}
+      try { openaiWs.close(); } catch {}
+      try { twilioWs.close(); } catch {}
     }
   });
 
   const cleanup = () => {
-    try {
-      openaiWs.close();
-    } catch {}
-    try {
-      twilioWs.close();
-    } catch {}
+    try { openaiWs.close(); } catch {}
+    try { twilioWs.close(); } catch {}
   };
 
   twilioWs.on("close", cleanup);

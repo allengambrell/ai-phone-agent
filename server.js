@@ -1,4 +1,4 @@
-const express = require("express");
+﻿const express = require("express");
 const bodyParser = require("body-parser");
 const WebSocket = require("ws");
 
@@ -41,7 +41,6 @@ wss.on("connection", (twilioWs) => {
   const MAX_PENDING = 200;
 
   const openaiWs = new WebSocket(
-    // Realtime conversations guide recommends gpt-realtime for speech-to-speech
     "wss://api.openai.com/v1/realtime?model=gpt-realtime",
     {
       headers: {
@@ -55,7 +54,6 @@ wss.on("connection", (twilioWs) => {
     console.log("OpenAI WS open");
     openaiReady = true;
 
-    // IMPORTANT: Updated session.update shape (audio.format is an object)
     safeSend(openaiWs, {
       type: "session.update",
       session: {
@@ -73,12 +71,10 @@ Be concise and friendly.
 `,
         audio: {
           input: {
-            // Twilio Media Streams audio is G.711 u-law (PCMU) at 8kHz
             format: { type: "audio/pcmu", rate: 8000 },
             turn_detection: { type: "semantic_vad" }
           },
           output: {
-            // Send PCMU back so Twilio can play it
             format: { type: "audio/pcmu" },
             voice: "marin"
           }
@@ -86,10 +82,8 @@ Be concise and friendly.
       },
     });
 
-    // Flush any buffered audio frames
     while (pending.length) safeSend(openaiWs, pending.shift());
 
-    // Ask the model to speak first (greeting)
     safeSend(openaiWs, {
       type: "response.create",
       response: { modalities: ["audio"] }
@@ -100,17 +94,13 @@ Be concise and friendly.
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-    // Log key events so Railway logs show what’s happening
     if (msg.type && (msg.type.includes("error") || msg.type.includes("session") || msg.type.includes("response"))) {
-      if (msg.type === "response.output_audio.delta") {
-        // don’t spam logs for every chunk
-      } else {
+      if (msg.type !== "response.output_audio.delta") {
         console.log("OpenAI event:", msg.type);
         if (msg.error) console.log("OpenAI error detail:", msg.error);
       }
     }
 
-    // IMPORTANT: current docs say output audio bytes come via response.output_audio.delta
     if (msg.type === "response.output_audio.delta" && msg.delta && streamSid) {
       safeSend(twilioWs, {
         event: "media",
@@ -137,5 +127,28 @@ Be concise and friendly.
       const payload = msg.media?.payload;
       if (!payload) return;
 
-      const evt = { type: "input_aud
-::contentReference[oaicite:2]{index=2}
+      const evt = { type: "input_audio_buffer.append", audio: payload };
+
+      if (!openaiReady) {
+        pending.push(evt);
+        if (pending.length > MAX_PENDING) pending.shift();
+      } else {
+        safeSend(openaiWs, evt);
+      }
+      return;
+    }
+
+    if (msg.event === "stop") {
+      console.log("Twilio stream stop");
+      try { openaiWs.close(); } catch {}
+      try { twilioWs.close(); } catch {}
+    }
+  });
+
+  const cleanup = () => {
+    try { openaiWs.close(); } catch {}
+    try { twilioWs.close(); } catch {}
+  };
+  twilioWs.on("close", cleanup);
+  twilioWs.on("error", cleanup);
+});

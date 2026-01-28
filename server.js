@@ -11,7 +11,6 @@ const PORT = process.env.PORT || 3000;
 
 app.get("/", (req, res) => res.send("OK"));
 
-// Twilio Voice webhook -> starts Media Stream
 app.post("/voice", (req, res) => {
   const twiml = `
 <Response>
@@ -39,6 +38,7 @@ wss.on("connection", (twilioWs) => {
 
   let streamSid = null;
   let openaiReady = false;
+  let gotAnyAudioDelta = false;
 
   const pending = [];
   const MAX_PENDING = 200;
@@ -57,10 +57,7 @@ wss.on("connection", (twilioWs) => {
     console.log("OpenAI WS open");
     openaiReady = true;
 
-    // Session config aligned with Realtime WebSocket docs:
-    // - session.update
-    // - session.input_audio_format / session.output_audio_format
-    // - session.turn_detection (VAD) :contentReference[oaicite:3]{index=3}
+    // Max compatibility: avoid voice/turn_detection until we know what's supported
     safeSend(openaiWs, {
       type: "session.update",
       session: {
@@ -73,22 +70,13 @@ You are a professional phone answering assistant for Allen.
 - If asked to speak to Allen, say: "One moment please—I'll take a message and pass it along."
 Be concise and friendly.
 `,
-        // Twilio Media Streams is mulaw/PCMU @ 8kHz :contentReference[oaicite:4]{index=4}
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
-
-        // Let the server decide when the caller stopped talking
-        turn_detection: { type: "server_vad" },
-
-        // Voice may vary by model/account; if unsupported you'll see an error in logs
-        voice: "alloy",
       },
     });
 
-    // Flush any buffered audio frames
     while (pending.length) safeSend(openaiWs, pending.shift());
 
-    // IMPORTANT FIX: use output_modalities (not modalities) :contentReference[oaicite:5]{index=5}
     safeSend(openaiWs, {
       type: "response.create",
       response: {
@@ -99,33 +87,31 @@ Be concise and friendly.
 
   openaiWs.on("message", (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+    if (msg.type === "error") {
+      console.log("OpenAI ERROR FULL:", JSON.stringify(msg, null, 2));
       return;
     }
 
-    // Log useful events (avoid spamming deltas)
+    // Keep logs lightweight
     if (
       msg.type &&
       msg.type !== "response.output_audio.delta" &&
       msg.type !== "response.audio.delta" &&
-      msg.type !== "response.output_text.delta" &&
-      msg.type !== "response.output_audio_transcript.delta"
+      msg.type !== "response.output_text.delta"
     ) {
-      if (msg.type.includes("error") || msg.type.includes("session") || msg.type.includes("response")) {
+      if (msg.type.includes("session") || msg.type.includes("response")) {
         console.log("OpenAI event:", msg.type);
-        if (msg.error) console.log("OpenAI error detail:", msg.error);
       }
     }
 
-    // Handle both possible audio delta event names (docs show output_audio.delta; some accounts emit audio.delta) :contentReference[oaicite:6]{index=6}
     const audioDelta =
       (msg.type === "response.output_audio.delta" && msg.delta) ||
       (msg.type === "response.audio.delta" && msg.delta);
 
     if (audioDelta && streamSid) {
-      // Twilio expects base64 mulaw payload :contentReference[oaicite:7]{index=7}
+      gotAnyAudioDelta = true;
       safeSend(twilioWs, {
         event: "media",
         streamSid,
@@ -133,7 +119,10 @@ Be concise and friendly.
       });
     }
 
-    // Extra debug: if text is coming but audio isn’t, this will show it
+    if (msg.type === "response.done") {
+      console.log("OpenAI response.done. gotAnyAudioDelta =", gotAnyAudioDelta);
+    }
+
     if (msg.type === "response.output_text.delta" && msg.delta) {
       console.log("OpenAI text delta:", msg.delta);
     }
@@ -144,11 +133,7 @@ Be concise and friendly.
 
   twilioWs.on("message", (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || null;
@@ -160,7 +145,6 @@ Be concise and friendly.
       const payload = msg.media?.payload;
       if (!payload) return;
 
-      // Stream caller audio into OpenAI input buffer :contentReference[oaicite:8]{index=8}
       const evt = { type: "input_audio_buffer.append", audio: payload };
 
       if (!openaiReady) {

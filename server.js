@@ -10,7 +10,6 @@ const PORT = process.env.PORT || 3000;
 
 app.get("/", (req, res) => res.send("OK"));
 
-// Twilio Voice webhook -> starts Media Stream
 app.post("/voice", (req, res) => {
   const twiml = `
 <Response>
@@ -34,14 +33,16 @@ function safeSend(ws, obj) {
 }
 
 wss.on("connection", (twilioWs) => {
+  console.log("Twilio WS connected");
+
   let streamSid = null;
   let openaiReady = false;
-
   const pending = [];
   const MAX_PENDING = 200;
 
   const openaiWs = new WebSocket(
-    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
+    // Realtime conversations guide recommends gpt-realtime for speech-to-speech
+    "wss://api.openai.com/v1/realtime?model=gpt-realtime",
     {
       headers: {
         Authorization: `Bearer ${process.env.OPENAI_KEY}`,
@@ -51,41 +52,66 @@ wss.on("connection", (twilioWs) => {
   );
 
   openaiWs.on("open", () => {
+    console.log("OpenAI WS open");
     openaiReady = true;
 
+    // IMPORTANT: Updated session.update shape (audio.format is an object)
     safeSend(openaiWs, {
       type: "session.update",
       session: {
-        modalities: ["text", "audio"],
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-        voice: "alloy",
-        turn_detection: { type: "server_vad" },
+        type: "realtime",
+        model: "gpt-realtime",
+        output_modalities: ["audio"],
         instructions: `
 You are a professional phone answering assistant for Allen.
 
-Goals:
 - Greet the caller and ask how you can help.
 - Answer questions if you know; otherwise take a message.
 - Always capture: caller name, callback number, reason for calling.
 - If asked to speak to Allen, say: "One moment please—I'll take a message and pass it along."
-
 Be concise and friendly.
 `,
+        audio: {
+          input: {
+            // Twilio Media Streams audio is G.711 u-law (PCMU) at 8kHz
+            format: { type: "audio/pcmu", rate: 8000 },
+            turn_detection: { type: "semantic_vad" }
+          },
+          output: {
+            // Send PCMU back so Twilio can play it
+            format: { type: "audio/pcmu" },
+            voice: "marin"
+          }
+        }
       },
     });
 
+    // Flush any buffered audio frames
     while (pending.length) safeSend(openaiWs, pending.shift());
 
-    // Make the assistant greet first
-    safeSend(openaiWs, { type: "response.create" });
+    // Ask the model to speak first (greeting)
+    safeSend(openaiWs, {
+      type: "response.create",
+      response: { modalities: ["audio"] }
+    });
   });
 
   openaiWs.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-    if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
+    // Log key events so Railway logs show what’s happening
+    if (msg.type && (msg.type.includes("error") || msg.type.includes("session") || msg.type.includes("response"))) {
+      if (msg.type === "response.output_audio.delta") {
+        // don’t spam logs for every chunk
+      } else {
+        console.log("OpenAI event:", msg.type);
+        if (msg.error) console.log("OpenAI error detail:", msg.error);
+      }
+    }
+
+    // IMPORTANT: current docs say output audio bytes come via response.output_audio.delta
+    if (msg.type === "response.output_audio.delta" && msg.delta && streamSid) {
       safeSend(twilioWs, {
         event: "media",
         streamSid,
@@ -94,12 +120,16 @@ Be concise and friendly.
     }
   });
 
+  openaiWs.on("close", () => console.log("OpenAI WS closed"));
+  openaiWs.on("error", (e) => console.log("OpenAI WS error:", e?.message || e));
+
   twilioWs.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || null;
+      console.log("Twilio stream start:", streamSid);
       return;
     }
 
@@ -107,29 +137,5 @@ Be concise and friendly.
       const payload = msg.media?.payload;
       if (!payload) return;
 
-      const evt = { type: "input_audio_buffer.append", audio: payload };
-
-      if (!openaiReady) {
-        pending.push(evt);
-        if (pending.length > MAX_PENDING) pending.shift();
-      } else {
-        safeSend(openaiWs, evt);
-      }
-      return;
-    }
-
-    if (msg.event === "stop") {
-      try { openaiWs.close(); } catch {}
-      try { twilioWs.close(); } catch {}
-    }
-  });
-
-  const cleanup = () => {
-    try { openaiWs.close(); } catch {}
-    try { twilioWs.close(); } catch {}
-  };
-  twilioWs.on("close", cleanup);
-  openaiWs.on("close", cleanup);
-  twilioWs.on("error", cleanup);
-  openaiWs.on("error", cleanup);
-});
+      const evt = { type: "input_aud
+::contentReference[oaicite:2]{index=2}

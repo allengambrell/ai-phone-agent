@@ -36,7 +36,7 @@ const VOICE_MODEL =
 
 // Fixed greeting
 const FIXED_GREETING =
-  "Thank you for calling Gambrell Photography, We are not able to come answer the phone at the moment.";
+  "Thank you for calling Gambrell Photography, we are unable to come to the phone at the present time. Would you like to leave a message with our AI Agent?";
 
 // ====== Recording storage for listen links (MP3 bytes) ======
 const recordingStore = new Map(); // token -> { mp3: Buffer, createdAt, meta }
@@ -355,8 +355,9 @@ Return ONLY JSON with this shape:
 }
 
 Outcome rules:
-- "Message" if the caller is primarily leaving a message / requesting a callback.
-- "AI" if the caller's questions were answered/handled without being mainly a message.
+- "Message" if the caller leaves any message content OR provides name/number OR requests a callback OR the assistant asks them to leave a message.
+- "AI" only if the caller’s question was fully answered AND no message/callback info was taken.
+
 
 Transcript:
 ${transcript}
@@ -552,15 +553,36 @@ wss.on("connection", (twilioWs) => {
         voice: "alloy",
         turn_detection: { type: "server_vad" },
         instructions: `
-You are the phone answering assistant for ${BUSINESS_NAME}.
+You are the answering machine for ${BUSINESS_NAME}. Your primary job is to take a message.
+
+Opening:
+- After the fixed greeting is spoken, pause and wait for the caller.
+
+Default behavior:
+- Assume the caller wants to leave a message.
+- Ask for: (1) full name, (2) best callback number, (3) reason for calling, (4) preferred time to call back.
+
+Simple Q&A (only if confident):
+- If the caller asks a SIMPLE question and you are highly confident the answer is correct:
+  - Answer briefly (1 sentence).
+  - Then ALWAYS say:
+    "May I get your name and best callback number in case we need to follow up?"
+- If you are NOT totally sure:
+  - Say: "I don’t want to give you incorrect information."
+  - Then say: "May I get your name and best callback number and we’ll get back to you?"
+
+Message handling:
+- Always attempt to collect name and callback number.
+- If caller provides only partial info, politely ask for the missing piece.
 
 Rules:
-- After the fixed greeting, WAIT for the caller to speak.
-- Never speak over the caller. If the caller starts speaking, stop immediately.
-- Keep responses concise (1–2 sentences).
-- Ask one question at a time if you need details.
-- If asked to speak to ${OWNER_NAME}, say you can take a message and pass it along.
+- Never speak over the caller.
+- If the caller starts speaking, stop immediately.
+- Ask only one question at a time.
+- Keep responses short and calm.
 `,
+
+
       },
     });
 

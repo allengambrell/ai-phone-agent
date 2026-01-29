@@ -57,7 +57,7 @@ wss.on("connection", (twilioWs) => {
     console.log("OpenAI WS open");
     openaiReady = true;
 
-    // Max compatibility: avoid voice/turn_detection until we know what's supported
+    // Keep session.update minimal for compatibility
     safeSend(openaiWs, {
       type: "session.update",
       session: {
@@ -77,10 +77,12 @@ Be concise and friendly.
 
     while (pending.length) safeSend(openaiWs, pending.shift());
 
+    // FIX: your account expects response.modalities (not response.output_modalities)
+    // And it must be ["audio","text"] (audio-only is rejected).
     safeSend(openaiWs, {
       type: "response.create",
       response: {
-        output_modalities: ["audio", "text"],
+        modalities: ["audio", "text"],
       },
     });
   });
@@ -94,7 +96,6 @@ Be concise and friendly.
       return;
     }
 
-    // Keep logs lightweight
     if (
       msg.type &&
       msg.type !== "response.output_audio.delta" &&
@@ -106,6 +107,7 @@ Be concise and friendly.
       }
     }
 
+    // Handle either event name
     const audioDelta =
       (msg.type === "response.output_audio.delta" && msg.delta) ||
       (msg.type === "response.audio.delta" && msg.delta);

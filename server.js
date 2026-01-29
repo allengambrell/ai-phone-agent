@@ -21,6 +21,11 @@ const PORT = process.env.PORT || 3000;
 // RESEND_API_KEY
 // EMAIL_FROM                    (must be verified in Resend; use onboarding sender until verified)
 // EMAIL_TO
+//
+// Optional:
+// OWNER_NAME
+// BUSINESS_NAME
+// VOICE_MODEL
 
 const OPENAI_KEY = process.env.OPENAI_KEY;
 
@@ -35,11 +40,15 @@ const EMAIL_TO = process.env.EMAIL_TO;
 const EMAIL_FROM = process.env.EMAIL_FROM;
 
 const OWNER_NAME = process.env.OWNER_NAME || "Allen";
-const BUSINESS_NAME = process.env.BUSINESS_NAME || "AI Phone Agent";
+const BUSINESS_NAME = process.env.BUSINESS_NAME || "Gambrell Photography";
 
 // Use the model you confirmed is speaking
 const VOICE_MODEL =
   process.env.VOICE_MODEL || "gpt-4o-realtime-preview-2024-12-17";
+
+// Fixed greeting you requested (must be consistent)
+const FIXED_GREETING =
+  "Thank you for calling Gambrell Photography, We are not able to come answer the phone at the moment.";
 
 // In-memory storage for listen links (MP3 bytes)
 const recordingStore = new Map(); // token -> { mp3: Buffer, createdAt, meta }
@@ -122,7 +131,9 @@ app.post("/recording-status", async (req, res) => {
       return;
     }
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
-      console.log("recording-status: missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
+      console.log(
+        "recording-status: missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN"
+      );
       return;
     }
     if (!OPENAI_KEY) {
@@ -134,7 +145,11 @@ app.post("/recording-status", async (req, res) => {
 
     // Twilio recording download: append .mp3
     const mp3Url = `${RecordingUrl}.mp3`;
-    const mp3 = await downloadWithTwilioAuth(mp3Url, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+    const mp3 = await downloadWithTwilioAuth(
+      mp3Url,
+      TWILIO_ACCOUNT_SID,
+      TWILIO_AUTH_TOKEN
+    );
 
     const transcript = await transcribeMp3WithOpenAI(mp3);
     const summary = await summarizeTranscript(transcript);
@@ -156,7 +171,10 @@ app.post("/recording-status", async (req, res) => {
       meta: { CallSid, RecordingSid, RecordingDuration },
     });
 
-    console.log("recording-status: Resend email sent for RecordingSid:", RecordingSid);
+    console.log(
+      "recording-status: Resend email sent for RecordingSid:",
+      RecordingSid
+    );
   } catch (err) {
     console.log("recording-status ERROR:", err?.stack || err?.message || err);
   }
@@ -164,8 +182,13 @@ app.post("/recording-status", async (req, res) => {
 
 async function downloadWithTwilioAuth(url, accountSid, authToken) {
   const basic = Buffer.from(`${accountSid}:${authToken}`).toString("base64");
-  const resp = await fetch(url, { headers: { Authorization: `Basic ${basic}` } });
-  if (!resp.ok) throw new Error(`Twilio download failed ${resp.status}: ${await resp.text()}`);
+  const resp = await fetch(url, {
+    headers: { Authorization: `Basic ${basic}` },
+  });
+  if (!resp.ok)
+    throw new Error(
+      `Twilio download failed ${resp.status}: ${await resp.text()}`
+    );
   return Buffer.from(await resp.arrayBuffer());
 }
 
@@ -180,7 +203,10 @@ async function transcribeMp3WithOpenAI(mp3Buffer) {
     body: fd,
   });
 
-  if (!resp.ok) throw new Error(`OpenAI transcribe failed ${resp.status}: ${await resp.text()}`);
+  if (!resp.ok)
+    throw new Error(
+      `OpenAI transcribe failed ${resp.status}: ${await resp.text()}`
+    );
   const data = await resp.json();
   return (data.text || "").trim();
 }
@@ -197,7 +223,10 @@ ${transcript}`;
 
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${OPENAI_KEY}`,
+      "Content-Type": "application/json",
+    },
     body: JSON.stringify({
       model: "gpt-4o-mini",
       messages: [{ role: "user", content: prompt }],
@@ -206,14 +235,19 @@ ${transcript}`;
     }),
   });
 
-  if (!resp.ok) throw new Error(`OpenAI summarize failed ${resp.status}: ${await resp.text()}`);
+  if (!resp.ok)
+    throw new Error(
+      `OpenAI summarize failed ${resp.status}: ${await resp.text()}`
+    );
   const data = await resp.json();
   return (data.choices?.[0]?.message?.content || "").trim();
 }
 
 async function emailResults({ subject, transcript, summary, listenLink, meta }) {
   if (!RESEND_API_KEY || !EMAIL_TO || !EMAIL_FROM) {
-    console.log("Email not configured. Missing RESEND_API_KEY / EMAIL_TO / EMAIL_FROM.");
+    console.log(
+      "Email not configured. Missing RESEND_API_KEY / EMAIL_TO / EMAIL_FROM."
+    );
     return;
   }
 
@@ -278,7 +312,7 @@ wss.on("connection", (twilioWs) => {
   // Throttle repeated triggers
   let lastSpeechStoppedAt = 0;
 
-  // Track whether OpenAI is responding
+  // Track whether OpenAI is responding (speaking)
   let responseInProgress = false;
 
   // Queue output audio until streamSid exists
@@ -299,6 +333,18 @@ wss.on("connection", (twilioWs) => {
       streamSid,
       media: { payload: base64Mulaw },
     });
+  }
+
+  // Barge-in support: cancel assistant if caller starts talking
+  function clearTwilioAudioQueue() {
+    outQueue.length = 0;
+  }
+
+  function interruptAssistant(openaiWs) {
+    clearTwilioAudioQueue();
+    // Cancel current response so it stops generating audio
+    wsSend(openaiWs, { type: "response.cancel" });
+    responseInProgress = false;
   }
 
   if (!OPENAI_KEY) {
@@ -328,29 +374,49 @@ wss.on("connection", (twilioWs) => {
         voice: "alloy",
         turn_detection: { type: "server_vad" },
         instructions: `
-You are a friendly, professional phone answering assistant for ${OWNER_NAME}.
-- Greet the caller and ask how you can help.
-- Be concise.
-- If asked to speak to ${OWNER_NAME}, say you’ll take a message and pass it along.
+You are the phone answering assistant for Gambrell Photography.
+
+Rules:
+- After the fixed greeting, WAIT for the caller to speak.
+- Never speak over the caller. If the caller starts speaking, stop immediately.
+- Keep responses concise (1–2 sentences).
+- Ask one question at a time if you need details.
+- If asked to speak to ${OWNER_NAME}, say you can take a message and pass it along.
 `,
       },
     });
 
-    // Speak first (greeting)
+    // Speak a FIXED greeting (exact wording) and then wait.
     wsSend(openaiWs, {
       type: "response.create",
-      response: { modalities: ["audio", "text"] },
+      response: {
+        modalities: ["audio", "text"],
+        instructions: `Say exactly: '${FIXED_GREETING}' Then stop and wait for the caller.`,
+      },
     });
+
     responseInProgress = true;
   });
 
   openaiWs.on("message", (raw) => {
     let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
 
     if (msg.type === "error") {
       console.log("OpenAI ERROR:", JSON.stringify(msg, null, 2));
       return;
+    }
+
+    // If OpenAI detects the caller started speaking, barge-in cancel
+    if (msg.type === "input_audio_buffer.speech_started") {
+      if (responseInProgress) {
+        console.log("Barge-in: caller started speaking; cancelling assistant response");
+        interruptAssistant(openaiWs);
+      }
     }
 
     // Output audio deltas (support both names)
@@ -363,7 +429,7 @@ You are a friendly, professional phone answering assistant for ${OWNER_NAME}.
     if (msg.type === "response.created") responseInProgress = true;
     if (msg.type === "response.done") responseInProgress = false;
 
-    // When caller stops talking, commit and respond
+    // When caller stops talking, commit and respond (if safe)
     if (msg.type === "input_audio_buffer.speech_stopped") {
       const now = Date.now();
 
@@ -393,7 +459,11 @@ You are a friendly, professional phone answering assistant for ${OWNER_NAME}.
 
   twilioWs.on("message", (raw) => {
     let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
 
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || null;
@@ -409,6 +479,12 @@ You are a friendly, professional phone answering assistant for ${OWNER_NAME}.
     if (msg.event === "media") {
       const payload = msg.media?.payload;
       if (!payload) return;
+
+      // If caller audio arrives while assistant is talking, barge-in immediately
+      if (responseInProgress) {
+        console.log("Barge-in: media received while assistant speaking; cancelling response");
+        interruptAssistant(openaiWs);
+      }
 
       wsSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
 

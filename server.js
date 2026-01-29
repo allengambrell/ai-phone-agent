@@ -47,12 +47,16 @@ setInterval(() => {
 // ------------ Email transport ------------
 function getMailer() {
   if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !EMAIL_FROM || !EMAIL_TO) return null;
-  return nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_PORT === 465,
-    auth: { user: SMTP_USER, pass: SMTP_PASS },
-  });
+return nodemailer.createTransport({
+  host: SMTP_HOST,
+  port: SMTP_PORT,
+  secure: false, // STARTTLS
+  auth: { user: SMTP_USER, pass: SMTP_PASS },
+  tls: {
+    rejectUnauthorized: false,
+  },
+});
+
 }
 
 app.get("/", (req, res) => res.send("OK"));

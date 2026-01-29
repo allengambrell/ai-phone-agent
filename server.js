@@ -38,27 +38,14 @@ const VOICE_MODEL =
 const FIXED_GREETING =
   "Thank you for calling Gambrell Photography, We are not able to come answer the phone at the moment.";
 
-// ====== In-memory Stores ======
-
-// Recording listen links
+// ====== Recording storage for listen links (MP3 bytes) ======
 const recordingStore = new Map(); // token -> { mp3: Buffer, createdAt, meta }
 const RECORDING_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-// Call metadata keyed by CallSid
-// includes: from, callerName (CNAM if available), answeredType (Answered/AI/Message), call start time, etc.
-const callMetaStore = new Map(); // CallSid -> meta
-const CALLMETA_TTL_MS = 24 * 60 * 60 * 1000;
-
-// cleanup
 setInterval(() => {
   const now = Date.now();
   for (const [token, item] of recordingStore.entries()) {
     if (now - item.createdAt > RECORDING_TTL_MS) recordingStore.delete(token);
-  }
-  for (const [callSid, meta] of callMetaStore.entries()) {
-    if (!meta?.receivedAtMs || now - meta.receivedAtMs > CALLMETA_TTL_MS) {
-      callMetaStore.delete(callSid);
-    }
   }
 }, 60 * 60 * 1000).unref();
 
@@ -75,9 +62,8 @@ app.get("/listen/:token", (req, res) => {
 });
 
 /**
- * /voice: Twilio hits this when the call comes in.
- * We start recording, then Dial your landline FIRST.
- * We set action="/dial-result" so Twilio posts Dial outcome to us.
+ * /voice: Twilio hits this on incoming call.
+ * We start recording, ring your landline first, and POST dial outcome to /dial-result.
  */
 app.post("/voice", (req, res) => {
   if (!PUBLIC_BASE_URL) return res.status(500).send("Missing PUBLIC_BASE_URL");
@@ -91,27 +77,10 @@ app.post("/voice", (req, res) => {
       ? Math.floor(LANDLINE_RING_SECONDS)
       : 15;
 
-  const callbackUrl = `${PUBLIC_BASE_URL}/recording-status?secret=${encodeURIComponent(
+  const recordingCallbackUrl = `${PUBLIC_BASE_URL}/recording-status?secret=${encodeURIComponent(
     RECORDING_WEBHOOK_SECRET
   )}`;
 
-  // Capture caller info now (From + CallerName if present)
-  const callSid = req.body?.CallSid;
-  const from = req.body?.From || req.body?.Caller || "";
-  const callerName = req.body?.CallerName || ""; // CNAM if available
-  if (callSid) {
-    callMetaStore.set(callSid, {
-      callSid,
-      from,
-      callerName,
-      receivedAtMs: Date.now(),
-      answeredType: "AI", // default; will be overwritten to Answered if landline picks up
-      twilioBody: req.body,
-    });
-    console.log("Captured call meta:", { callSid, from, callerName });
-  }
-
-  // IMPORTANT: Use action so we know if landline answered.
   const dialAction = `${PUBLIC_BASE_URL}/dial-result`;
 
   const twiml = `
@@ -119,7 +88,7 @@ app.post("/voice", (req, res) => {
   <Start>
     <Recording
       channels="dual"
-      recordingStatusCallback="${callbackUrl}"
+      recordingStatusCallback="${recordingCallbackUrl}"
       recordingStatusCallbackMethod="POST"
       recordingStatusCallbackEvent="completed"
     />
@@ -134,29 +103,19 @@ app.post("/voice", (req, res) => {
 });
 
 /**
- * /dial-result: Twilio posts Dial outcome here.
- * If landline answered -> end call (do NOT go to AI).
- * If no-answer/busy/failed -> connect to AI media stream.
+ * /dial-result: Twilio posts dial outcome.
+ * If landline answered -> hang up TwiML (call already handled).
+ * If not answered/busy/failed -> route to AI stream.
  */
 app.post("/dial-result", (req, res) => {
   const callSid = req.body?.CallSid;
   const dialStatus = req.body?.DialCallStatus; // completed | no-answer | busy | failed | canceled
-
   console.log("Dial result:", { callSid, dialStatus });
 
-  if (callSid && callMetaStore.has(callSid)) {
-    const meta = callMetaStore.get(callSid);
-    // If completed, landline answered.
-    if (dialStatus === "completed") meta.answeredType = "Answered";
-    callMetaStore.set(callSid, meta);
-  }
-
   if (dialStatus === "completed") {
-    // Landline handled it; don't route to AI
     return res.type("text/xml").send(`<Response><Hangup/></Response>`);
   }
 
-  // Otherwise route to AI
   const twiml = `
 <Response>
   <Connect>
@@ -167,8 +126,9 @@ app.post("/dial-result", (req, res) => {
 });
 
 /**
- * Twilio recording callback after call ends.
- * We download recording, transcribe, summarize, classify outcome, email.
+ * /recording-status: Twilio posts when recording is ready.
+ * We fetch caller number + landline-answered status from Twilio API (reliable),
+ * then download recording, transcribe, summarize, email with subject format.
  */
 app.post("/recording-status", async (req, res) => {
   res.status(200).send("OK");
@@ -192,7 +152,7 @@ app.post("/recording-status", async (req, res) => {
     } = req.body;
 
     if (RecordingStatus !== "completed") return;
-    if (!RecordingSid || !RecordingUrl) return;
+    if (!RecordingSid || !RecordingUrl || !CallSid) return;
 
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
       console.log("recording-status: missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
@@ -202,43 +162,52 @@ app.post("/recording-status", async (req, res) => {
       console.log("recording-status: missing OPENAI_KEY");
       return;
     }
+    if (!PUBLIC_BASE_URL) {
+      console.log("recording-status: missing PUBLIC_BASE_URL");
+      return;
+    }
 
+    // --- Fetch call details from Twilio (this fixes blank phone number) ---
+    const call = await twilioGetCall(CallSid);
+    const phoneNumber = (call?.from || "").trim();
+    const callerIdName = (call?.caller_name || "").trim(); // may be empty; depends on Twilio/CNAM
+
+    // Use Twilio call start time when available, else recording start time
+    const startUtc = call?.start_time
+      ? new Date(call.start_time)
+      : (RecordingStartTime ? new Date(RecordingStartTime) : new Date());
+    const { date: easternDate, time: easternTime } = formatEasternFromUtcDate(startUtc);
+
+    // --- Determine if landline answered (Answered) ---
+    // If Twilio created an outbound child call to LANDLINE_NUMBER and it completed => Answered
+    const landlineAnswered = await twilioDidLandlineAnswer(CallSid, LANDLINE_NUMBER);
+
+    // Download recording
     const mp3Url = `${RecordingUrl}.mp3`;
     const mp3 = await downloadWithTwilioAuth(mp3Url, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
+    // Transcribe
     const transcript = await transcribeMp3WithOpenAI(mp3);
 
-    // Summarize + classify as AI vs Message (for AI-handled calls)
+    // Summarize + classify outcome for AI calls
     const summaryObj = await summarizeAndClassifyTranscript(transcript);
     const summaryText = summaryObj.summary || "";
     const outcome = summaryObj.outcome || "AI"; // AI | Message
 
-    // Extract name (First/Last) from transcript
+    // Extract name from transcript (if caller said it)
     const extractedName = await extractCallerNameFromTranscript(transcript);
-    const extractedFullName = [extractedName.firstName, extractedName.lastName].filter(Boolean).join(" ").trim();
+    const extractedFullName = [extractedName.firstName, extractedName.lastName]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
 
-    // Pull caller info captured at /voice
-    const callMeta = callMetaStore.get(CallSid) || {};
-    const phoneNumber = (callMeta.from || "").trim();
-    const callerIdName = (callMeta.callerName || "").trim();
+    // ANSWEREDTYPE
+    const answeredType = landlineAnswered ? "Answered" : (outcome === "Message" ? "Message" : "AI");
 
-    // Determine ANSWEREDTYPE
-    let answeredType = callMeta.answeredType || "AI";
-    if (answeredType !== "Answered") {
-      // only classify AI vs Message when it wasn't answered by landline
-      answeredType = outcome === "Message" ? "Message" : "AI";
-      callMeta.answeredType = answeredType;
-      callMetaStore.set(CallSid, callMeta);
-    }
+    // NAME in subject: transcript name if present, else caller ID name if available, else "Unknown"
+    const nameForSubject = extractedFullName || callerIdName || "Unknown";
 
-    // NAME: use extracted name if present, else caller ID name, else blank
-    const nameForSubject = extractedFullName || callerIdName || "";
-
-    // Eastern time
-    const startUtc = RecordingStartTime ? new Date(RecordingStartTime) : new Date();
-    const { date: easternDate, time: easternTime } = formatEasternFromUtcDate(startUtc);
-
-    // Save listen token
+    // Save listen link token
     const token = crypto.randomBytes(24).toString("hex");
     recordingStore.set(token, {
       mp3,
@@ -247,9 +216,8 @@ app.post("/recording-status", async (req, res) => {
     });
     const listenLink = `${PUBLIC_BASE_URL}/listen/${token}`;
 
-    // Subject format requested:
-    // Call: PHONENUMBER - NAME - ANSWEREDTYPE
-    const subject = `Call: ${phoneNumber || "Unknown"} - ${nameForSubject || "Unknown"} - ${answeredType}`;
+    // Subject format requested
+    const subject = `Call: ${phoneNumber || "Unknown"} - ${nameForSubject} - ${answeredType}`;
 
     await emailResults({
       subject,
@@ -273,7 +241,45 @@ app.post("/recording-status", async (req, res) => {
   }
 });
 
-// ====== Helpers ======
+// ====== Twilio API Helpers (reliable caller + answered detection) ======
+
+async function twilioFetchJson(pathWithQuery) {
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/${pathWithQuery}`;
+  const basic = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+  const resp = await fetch(url, { headers: { Authorization: `Basic ${basic}` } });
+  if (!resp.ok) throw new Error(`Twilio API ${resp.status}: ${await resp.text()}`);
+  return await resp.json();
+}
+
+async function twilioGetCall(callSid) {
+  // Returns call object with .from, .start_time, etc.
+  return await twilioFetchJson(`Calls/${callSid}.json`);
+}
+
+async function twilioDidLandlineAnswer(parentCallSid, landlineE164) {
+  try {
+    // List child calls created by <Dial> (parentCallSid)
+    // Twilio returns: { calls: [...] }
+    const qs = new URLSearchParams({ ParentCallSid: parentCallSid, PageSize: "50" }).toString();
+    const data = await twilioFetchJson(`Calls.json?${qs}`);
+    const calls = Array.isArray(data?.calls) ? data.calls : [];
+
+    // Look for a child call to the landline that completed (answered)
+    // The "to" format is usually "+1..." in E.164.
+    const normalized = (landlineE164 || "").trim();
+    return calls.some((c) => {
+      const to = (c?.to || "").trim();
+      const status = (c?.status || "").trim(); // completed/in-progress/no-answer/busy/failed
+      const duration = Number(c?.duration || 0);
+      return to === normalized && status === "completed" && duration > 0;
+    });
+  } catch (e) {
+    console.log("Landline answer check failed:", e?.message || e);
+    return false;
+  }
+}
+
+// ====== OpenAI + Recording helpers ======
 
 async function downloadWithTwilioAuth(url, accountSid, authToken) {
   const basic = Buffer.from(`${accountSid}:${authToken}`).toString("base64");
@@ -309,7 +315,7 @@ function formatEasternFromUtcDate(dateObj) {
   return { date, time };
 }
 
-// Summarize + classify AI vs Message
+// Summarize + classify AI vs Message (only used for AI-routed calls)
 async function summarizeAndClassifyTranscript(transcript) {
   if (!OPENAI_KEY || !transcript) return { summary: "", outcome: "AI" };
 
@@ -319,14 +325,14 @@ You are summarizing a business phone call for ${BUSINESS_NAME}.
 Return ONLY JSON with this shape:
 {
   "outcome": "AI" | "Message",
-  "summary": "3-6 bullet points",
+  "summary": "3-6 bullet points (as plain text, not an array)",
   "action_items": ["..."],
   "key_details": ["..."]
 }
 
 Outcome rules:
-- "Message" if the caller is primarily leaving a message / requesting a callback, and the assistant is taking a message.
-- "AI" if the caller's questions were answered or handled without it being mainly "leave a message".
+- "Message" if the caller is primarily leaving a message / requesting a callback.
+- "AI" if the caller's questions were answered/handled without being mainly a message.
 
 Transcript:
 ${transcript}
@@ -334,10 +340,7 @@ ${transcript}
 
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_KEY}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "gpt-4o-mini",
       messages: [{ role: "user", content: prompt }],
@@ -363,6 +366,7 @@ ${transcript}
       key_details: Array.isArray(obj.key_details) ? obj.key_details : [],
     };
   } catch {
+    // fallback: treat as AI
     return { summary: text, outcome: "AI" };
   }
 }
@@ -382,10 +386,7 @@ ${transcript}
 
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_KEY}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "gpt-4o-mini",
       messages: [{ role: "user", content: prompt }],
@@ -410,6 +411,7 @@ ${transcript}
   }
 }
 
+// Email via Resend
 async function emailResults({ subject, transcript, summary, listenLink, meta, callInfo }) {
   if (!RESEND_API_KEY || !EMAIL_TO || !EMAIL_FROM) {
     console.log("Email not configured. Missing RESEND_API_KEY / EMAIL_TO / EMAIL_FROM.");
@@ -458,16 +460,13 @@ ${transcript}
     }),
   });
 
-  if (!resp.ok) {
-    const errText = await resp.text();
-    throw new Error(`Resend email failed ${resp.status}: ${errText}`);
-  }
+  if (!resp.ok) throw new Error(`Resend email failed ${resp.status}: ${await resp.text()}`);
 
   const data = await resp.json();
   console.log("Resend email sent:", data?.id || data);
 }
 
-// ==================== Realtime Voice Bridge ====================
+// ==================== Realtime Voice Bridge (AI fallback) ====================
 const server = app.listen(PORT, () => console.log("Server running on port", PORT));
 const wss = new WebSocket.Server({ server, path: "/media" });
 
@@ -515,9 +514,7 @@ wss.on("connection", (twilioWs) => {
 
   const openaiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(VOICE_MODEL)}`,
-    {
-      headers: { Authorization: `Bearer ${OPENAI_KEY}`, "OpenAI-Beta": "realtime=v1" },
-    }
+    { headers: { Authorization: `Bearer ${OPENAI_KEY}`, "OpenAI-Beta": "realtime=v1" } }
   );
 
   openaiWs.on("open", () => {
@@ -550,7 +547,6 @@ Rules:
         instructions: `Say exactly: '${FIXED_GREETING}' Then stop and wait for the caller.`,
       },
     });
-
     responseInProgress = true;
   });
 
@@ -604,7 +600,6 @@ Rules:
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || null;
       console.log("Stream started:", streamSid);
-
       while (outQueue.length) {
         const b64 = outQueue.shift();
         wsSend(twilioWs, { event: "media", streamSid, media: { payload: b64 } });

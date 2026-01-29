@@ -6,13 +6,19 @@ const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 
 const app = express();
+
+// Twilio callbacks are application/x-www-form-urlencoded
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 
 const OPENAI_KEY = process.env.OPENAI_KEY;
+
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // https://...railway.app
+const RECORDING_WEBHOOK_SECRET = process.env.RECORDING_WEBHOOK_SECRET;
+
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID; // AC...
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 
 const EMAIL_TO = process.env.EMAIL_TO;
@@ -24,15 +30,10 @@ const SMTP_PASS = process.env.SMTP_PASS;
 
 const OWNER_NAME = process.env.OWNER_NAME || "Allen";
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "AI Phone Agent";
-
-// Use the model you already confirmed works for voice.
-// If you changed it, update here.
 const VOICE_MODEL =
   process.env.VOICE_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 
-const RECORDING_WEBHOOK_SECRET = process.env.RECORDING_WEBHOOK_SECRET;
-
-// --------- in-memory recording store for "listen" links ---------
+// In-memory storage for listen links (MP3 bytes)
 const recordingStore = new Map(); // token -> { mp3: Buffer, createdAt, meta }
 const RECORDING_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -43,11 +44,9 @@ setInterval(() => {
   }
 }, 60 * 60 * 1000).unref();
 
-// --------- nodemailer transport ---------
+// ------------ Email transport ------------
 function getMailer() {
-  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !EMAIL_FROM || !EMAIL_TO) {
-    return null;
-  }
+  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !EMAIL_FROM || !EMAIL_TO) return null;
   return nodemailer.createTransport({
     host: SMTP_HOST,
     port: SMTP_PORT,
@@ -58,38 +57,22 @@ function getMailer() {
 
 app.get("/", (req, res) => res.send("OK"));
 
-// Listen link (MP3)
+// Private listen link
 app.get("/listen/:token", (req, res) => {
   const item = recordingStore.get(req.params.token);
   if (!item) return res.status(404).send("Not found (expired or invalid).");
-
   res.setHeader("Content-Type", "audio/mpeg");
   res.setHeader("Content-Disposition", 'inline; filename="call.mp3"');
   res.send(item.mp3);
 });
 
-// --------------------
-// Twilio Voice webhook
-// --------------------
-// Starts call recording + media stream
+// Twilio Voice webhook: starts recording + media stream
 app.post("/voice", (req, res) => {
-  if (!PUBLIC_BASE_URL) {
-    return res
-      .status(500)
-      .type("text/plain")
-      .send("Missing PUBLIC_BASE_URL env var.");
-  }
-  if (!RECORDING_WEBHOOK_SECRET) {
-    return res
-      .status(500)
-      .type("text/plain")
-      .send("Missing RECORDING_WEBHOOK_SECRET env var.");
-  }
+  if (!PUBLIC_BASE_URL) return res.status(500).send("Missing PUBLIC_BASE_URL");
+  if (!RECORDING_WEBHOOK_SECRET) return res.status(500).send("Missing RECORDING_WEBHOOK_SECRET");
 
-  // Twilio <Start><Recording> begins recording immediately, before other TwiML :contentReference[oaicite:1]{index=1}
-  const callbackUrl = `${PUBLIC_BASE_URL}/recording-status?secret=${encodeURIComponent(
-    RECORDING_WEBHOOK_SECRET
-  )}`;
+  const callbackUrl =
+    `${PUBLIC_BASE_URL}/recording-status?secret=${encodeURIComponent(RECORDING_WEBHOOK_SECRET)}`;
 
   const twiml = `
 <Response>
@@ -97,6 +80,7 @@ app.post("/voice", (req, res) => {
     <Recording
       channels="dual"
       recordingStatusCallback="${callbackUrl}"
+      recordingStatusCallbackMethod="POST"
       recordingStatusCallbackEvent="completed"
     />
   </Start>
@@ -108,16 +92,20 @@ app.post("/voice", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// -------------------------------
-// Twilio recording status callback
-// -------------------------------
-// Twilio POSTs params like RecordingSid, RecordingUrl, RecordingDuration, CallSid, etc. :contentReference[oaicite:2]{index=2}
+// Twilio recording callback (fires after call ends and recording is ready)
 app.post("/recording-status", async (req, res) => {
+  // Always ACK quickly
+  res.status(200).send("OK");
+
   try {
     const secret = req.query.secret;
     if (!RECORDING_WEBHOOK_SECRET || secret !== RECORDING_WEBHOOK_SECRET) {
-      return res.status(403).send("Forbidden");
+      console.log("recording-status: forbidden (bad secret)");
+      return;
     }
+
+    // Log EVERYTHING so we can see if callback is firing
+    console.log("recording-status payload:", JSON.stringify(req.body, null, 2));
 
     const {
       CallSid,
@@ -127,38 +115,30 @@ app.post("/recording-status", async (req, res) => {
       RecordingDuration,
     } = req.body;
 
-    // Acknowledge quickly so Twilio is happy
-    res.status(200).send("OK");
-
-    if (RecordingStatus !== "completed") return;
-    if (!RecordingSid || !RecordingUrl) return;
-
-    console.log(
-      "Recording completed:",
-      RecordingSid,
-      "duration:",
-      RecordingDuration
-    );
-
-    // RecordingUrl from Twilio can be fetched as an MP3 by appending .mp3 :contentReference[oaicite:3]{index=3}
-    const mp3Url = `${RecordingUrl}.mp3`;
-
-    if (!TWILIO_AUTH_TOKEN) {
-      console.log("Missing TWILIO_AUTH_TOKEN; cannot download recording.");
+    if (RecordingStatus !== "completed") {
+      console.log("recording-status: not completed:", RecordingStatus);
+      return;
+    }
+    if (!RecordingSid || !RecordingUrl) {
+      console.log("recording-status: missing RecordingSid/RecordingUrl");
+      return;
+    }
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+      console.log("recording-status: missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
+      return;
+    }
+    if (!OPENAI_KEY) {
+      console.log("recording-status: missing OPENAI_KEY");
       return;
     }
 
-    // Download recording (Twilio uses HTTP Basic auth: AccountSid:AuthToken.
-    // For the media file, providing AuthToken as the password is sufficient when using the RecordingUrl.)
-    const mp3 = await downloadWithTwilioAuth(mp3Url, TWILIO_AUTH_TOKEN);
+    // Twilio lets you fetch as mp3 by appending .mp3
+    const mp3Url = `${RecordingUrl}.mp3`;
+    const mp3 = await downloadWithTwilioAuth(mp3Url, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-    // Transcribe via OpenAI Audio Transcriptions endpoint :contentReference[oaicite:4]{index=4}
     const transcript = await transcribeMp3WithOpenAI(mp3);
-
-    // Summarize transcript (actions + summary)
     const summary = await summarizeTranscript(transcript);
 
-    // Create a private listen link
     const token = crypto.randomBytes(24).toString("hex");
     recordingStore.set(token, {
       mp3,
@@ -168,49 +148,31 @@ app.post("/recording-status", async (req, res) => {
 
     const listenLink = `${PUBLIC_BASE_URL}/listen/${token}`;
 
-    // Email it
     await emailResults({
-      subject: `Call Recording + Transcript (${RecordingDuration || "?"}s)`,
+      subject: `Call: transcript + recording (${RecordingDuration || "?"}s)`,
       transcript,
       summary,
       listenLink,
       meta: { CallSid, RecordingSid, RecordingDuration },
     });
 
-    console.log("Email sent for RecordingSid:", RecordingSid);
+    console.log("recording-status: email sent for RecordingSid:", RecordingSid);
   } catch (err) {
-    console.log("recording-status handler error:", err?.message || err);
+    console.log("recording-status ERROR:", err?.stack || err?.message || err);
   }
 });
 
-async function downloadWithTwilioAuth(url, authToken) {
-  // Twilio recording media download supports .mp3 :contentReference[oaicite:5]{index=5}
-  // Use Basic auth with AuthToken as password; username can be blank in many environments.
-  // If your environment requires AccountSid as username, we can add it later.
-  const basic = Buffer.from(`:${authToken}`).toString("base64");
-
-  const resp = await fetch(url, {
-    headers: { Authorization: `Basic ${basic}` },
-  });
-
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Twilio download failed ${resp.status}: ${text}`);
-  }
+async function downloadWithTwilioAuth(url, accountSid, authToken) {
+  const basic = Buffer.from(`${accountSid}:${authToken}`).toString("base64");
+  const resp = await fetch(url, { headers: { Authorization: `Basic ${basic}` } });
+  if (!resp.ok) throw new Error(`Twilio download failed ${resp.status}: ${await resp.text()}`);
   return Buffer.from(await resp.arrayBuffer());
 }
 
 async function transcribeMp3WithOpenAI(mp3Buffer) {
-  if (!OPENAI_KEY) throw new Error("Missing OPENAI_KEY");
-
-  // Node 22 has Blob/FormData globally
   const fd = new FormData();
-  fd.append(
-    "file",
-    new Blob([mp3Buffer], { type: "audio/mpeg" }),
-    "call.mp3"
-  );
-  fd.append("model", "gpt-4o-mini-transcribe"); // supported by /v1/audio/transcriptions :contentReference[oaicite:6]{index=6}
+  fd.append("file", new Blob([mp3Buffer], { type: "audio/mpeg" }), "call.mp3");
+  fd.append("model", "gpt-4o-mini-transcribe");
 
   const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
@@ -218,47 +180,33 @@ async function transcribeMp3WithOpenAI(mp3Buffer) {
     body: fd,
   });
 
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`OpenAI transcription failed ${resp.status}: ${text}`);
-  }
-
+  if (!resp.ok) throw new Error(`OpenAI transcribe failed ${resp.status}: ${await resp.text()}`);
   const data = await resp.json();
-  // API returns { text: "..." } for simple transcriptions
   return (data.text || "").trim();
 }
 
 async function summarizeTranscript(transcript) {
-  if (!OPENAI_KEY) throw new Error("Missing OPENAI_KEY");
-
   const prompt = `Summarize this phone call transcript.
 Return:
-1) A short summary (3-6 bullets)
+1) Summary (3-6 bullets)
 2) Action items (bullets)
-3) Key details (Caller name/number if present, reason, requested follow-up)
+3) Key details (caller name/number if present, reason, requested follow-up)
 
 Transcript:
 ${transcript}`;
 
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_KEY}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "gpt-4o-mini",
       messages: [{ role: "user", content: prompt }],
       temperature: 0.2,
-      max_tokens: 500,
+      max_tokens: 600,
     }),
   });
 
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`OpenAI summarize failed ${resp.status}: ${text}`);
-  }
-
+  if (!resp.ok) throw new Error(`OpenAI summarize failed ${resp.status}: ${await resp.text()}`);
   const data = await resp.json();
   return (data.choices?.[0]?.message?.content || "").trim();
 }
@@ -266,19 +214,17 @@ ${transcript}`;
 async function emailResults({ subject, transcript, summary, listenLink, meta }) {
   const mailer = getMailer();
   if (!mailer) {
-    console.log(
-      "Email not configured (SMTP_* / EMAIL_* missing). Skipping email."
-    );
+    console.log("Email not configured. Missing SMTP_* or EMAIL_* env vars.");
     return;
   }
 
   const body = `
-${BUSINESS_NAME} — Call processed
+${BUSINESS_NAME} — call processed
 
 Listen:
 ${listenLink}
 
-Recording meta:
+Meta:
 - RecordingSid: ${meta.RecordingSid || ""}
 - CallSid: ${meta.CallSid || ""}
 - Duration: ${meta.RecordingDuration || ""} seconds
@@ -298,15 +244,13 @@ ${transcript}
   });
 }
 
-// --------------------
-// Realtime voice bridge
-// --------------------
+// -------------------- Realtime Voice Bridge --------------------
 const server = app.listen(PORT, () => console.log("Server running on port", PORT));
 const wss = new WebSocket.Server({ server, path: "/media" });
 
-function safeSend(ws, obj) {
+function wsSend(ws, obj) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(typeof obj === "string" ? obj : JSON.stringify(obj));
+  ws.send(JSON.stringify(obj));
 }
 
 wss.on("connection", (twilioWs) => {
@@ -314,20 +258,30 @@ wss.on("connection", (twilioWs) => {
 
   let streamSid = null;
 
-  // Queue audio until Twilio start arrives
-  const audioQueue = [];
-  const MAX_AUDIO_QUEUE = 300;
+  // Track how much audio we’ve appended since last commit
+  // Twilio Media Streams commonly sends 20ms frames; we’ll assume 20ms per media event.
+  let bufferedMs = 0;
+
+  // Prevent rapid repeat triggers
+  let lastSpeechStoppedAt = 0;
+
+  // Track whether OpenAI is currently speaking/responding
+  let responseInProgress = false;
+
+  // Queue audio output until streamSid exists
+  const outQueue = [];
+  const MAX_OUT_QUEUE = 300;
 
   function sendAudioToTwilio(base64Mulaw) {
     if (!base64Mulaw) return;
 
     if (!streamSid) {
-      audioQueue.push(base64Mulaw);
-      if (audioQueue.length > MAX_AUDIO_QUEUE) audioQueue.shift();
+      outQueue.push(base64Mulaw);
+      if (outQueue.length > MAX_OUT_QUEUE) outQueue.shift();
       return;
     }
 
-    safeSend(twilioWs, {
+    wsSend(twilioWs, {
       event: "media",
       streamSid,
       media: { payload: base64Mulaw },
@@ -350,12 +304,10 @@ wss.on("connection", (twilioWs) => {
     }
   );
 
-  let responseInProgress = false;
-
   openaiWs.on("open", () => {
     console.log("OpenAI realtime connected");
 
-    safeSend(openaiWs, {
+    wsSend(openaiWs, {
       type: "session.update",
       session: {
         input_audio_format: "g711_ulaw",
@@ -365,19 +317,16 @@ wss.on("connection", (twilioWs) => {
         instructions: `
 You are a friendly, professional phone answering assistant for ${OWNER_NAME}.
 - Greet the caller and ask how you can help.
-- Keep answers concise.
+- Be concise.
 - If asked to speak to ${OWNER_NAME}, say you’ll take a message and pass it along.
 `,
       },
     });
 
-    // Speak first
-    safeSend(openaiWs, {
+    // Speak first (greeting)
+    wsSend(openaiWs, {
       type: "response.create",
-      response: {
-        modalities: ["audio", "text"],
-        instructions: "Greet the caller warmly and ask how you can help.",
-      },
+      response: { modalities: ["audio", "text"] },
     });
     responseInProgress = true;
   });
@@ -391,6 +340,7 @@ You are a friendly, professional phone answering assistant for ${OWNER_NAME}.
       return;
     }
 
+    // Output audio
     const audioDelta =
       (msg.type === "response.audio.delta" && msg.delta) ||
       (msg.type === "response.output_audio.delta" && msg.delta);
@@ -400,22 +350,37 @@ You are a friendly, professional phone answering assistant for ${OWNER_NAME}.
     if (msg.type === "response.created") responseInProgress = true;
     if (msg.type === "response.done") responseInProgress = false;
 
-    // When user stops talking, commit and respond (if not already responding)
+    // When caller stops talking, commit and ask for a response
     if (msg.type === "input_audio_buffer.speech_stopped") {
-      if (!responseInProgress) {
-        safeSend(openaiWs, { type: "input_audio_buffer.commit" });
-        safeSend(openaiWs, {
-          type: "response.create",
-          response: { modalities: ["audio", "text"] },
-        });
-        responseInProgress = true;
+      const now = Date.now();
+
+      // throttle repeated triggers
+      if (now - lastSpeechStoppedAt < 400) return;
+      lastSpeechStoppedAt = now;
+
+      // Don't do anything while model is still responding
+      if (responseInProgress) return;
+
+      // Only commit if we have enough audio (>=100ms) to avoid commit_empty
+      if (bufferedMs < 100) {
+        // Not enough audio; just ignore this stop event.
+        return;
       }
+
+      // Commit and request response
+      wsSend(openaiWs, { type: "input_audio_buffer.commit" });
+      wsSend(openaiWs, { type: "response.create", response: { modalities: ["audio", "text"] } });
+      responseInProgress = true;
+
+      // Reset buffer counter after commit
+      bufferedMs = 0;
     }
   });
 
   openaiWs.on("close", () => console.log("OpenAI WS closed"));
   openaiWs.on("error", (e) => console.log("OpenAI WS error:", e?.message || e));
 
+  // Twilio -> OpenAI
   twilioWs.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -424,10 +389,9 @@ You are a friendly, professional phone answering assistant for ${OWNER_NAME}.
       streamSid = msg.start?.streamSid || null;
       console.log("Stream started:", streamSid);
 
-      // Flush queued audio
-      while (audioQueue.length) {
-        const b64 = audioQueue.shift();
-        safeSend(twilioWs, { event: "media", streamSid, media: { payload: b64 } });
+      while (outQueue.length) {
+        const b64 = outQueue.shift();
+        wsSend(twilioWs, { event: "media", streamSid, media: { payload: b64 } });
       }
       return;
     }
@@ -435,7 +399,12 @@ You are a friendly, professional phone answering assistant for ${OWNER_NAME}.
     if (msg.event === "media") {
       const payload = msg.media?.payload;
       if (!payload) return;
-      safeSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
+
+      // Append audio to OpenAI input buffer
+      wsSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
+
+      // Estimate buffered duration
+      bufferedMs += 20; // typical Twilio Media Stream frame
       return;
     }
 
@@ -450,7 +419,6 @@ You are a friendly, professional phone answering assistant for ${OWNER_NAME}.
     try { openaiWs.close(); } catch {}
     try { twilioWs.close(); } catch {}
   };
-
   twilioWs.on("close", cleanup);
   twilioWs.on("error", cleanup);
 });

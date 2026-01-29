@@ -256,28 +256,52 @@ async function twilioGetCall(callSid) {
   return await twilioFetchJson(`Calls/${callSid}.json`);
 }
 
+function normalizePhone(p) {
+  // Keep digits only; compare last 10 for US numbers
+  const digits = String(p || "").replace(/\D/g, "");
+  if (!digits) return "";
+  return digits.length > 10 ? digits.slice(-10) : digits; // last 10 digits
+}
+
 async function twilioDidLandlineAnswer(parentCallSid, landlineE164) {
   try {
-    // List child calls created by <Dial> (parentCallSid)
-    // Twilio returns: { calls: [...] }
-    const qs = new URLSearchParams({ ParentCallSid: parentCallSid, PageSize: "50" }).toString();
+    const qs = new URLSearchParams({
+      ParentCallSid: parentCallSid,
+      PageSize: "50",
+    }).toString();
+
     const data = await twilioFetchJson(`Calls.json?${qs}`);
     const calls = Array.isArray(data?.calls) ? data.calls : [];
 
-    // Look for a child call to the landline that completed (answered)
-    // The "to" format is usually "+1..." in E.164.
-    const normalized = (landlineE164 || "").trim();
+    const landlineNorm = normalizePhone(landlineE164);
+
+    // DEBUG: log what Twilio is returning so we can confirm
+    console.log(
+      "Child calls for ParentCallSid:",
+      parentCallSid,
+      calls.map((c) => ({
+        sid: c.sid,
+        to: c.to,
+        from: c.from,
+        status: c.status,
+        duration: c.duration,
+        direction: c.direction,
+      }))
+    );
+
+    // If ANY child call to your landline completed, treat as Answered.
+    // (No duration requirement; short calls can show 0.)
     return calls.some((c) => {
-      const to = (c?.to || "").trim();
-      const status = (c?.status || "").trim(); // completed/in-progress/no-answer/busy/failed
-      const duration = Number(c?.duration || 0);
-      return to === normalized && status === "completed" && duration > 0;
+      const toNorm = normalizePhone(c?.to);
+      const status = String(c?.status || "").toLowerCase();
+      return landlineNorm && toNorm === landlineNorm && status === "completed";
     });
   } catch (e) {
     console.log("Landline answer check failed:", e?.message || e);
     return false;
   }
 }
+
 
 // ====== OpenAI + Recording helpers ======
 

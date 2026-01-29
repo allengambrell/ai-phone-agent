@@ -3,7 +3,6 @@ const express = require("express");
 const bodyParser = require("body-parser");
 const WebSocket = require("ws");
 const crypto = require("crypto");
-const nodemailer = require("nodemailer");
 
 const app = express();
 
@@ -13,23 +12,32 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 
+// ====== Required env vars ======
+// OPENAI_KEY
+// PUBLIC_BASE_URL               (https://your-app.up.railway.app)
+// RECORDING_WEBHOOK_SECRET      (random string)
+// TWILIO_ACCOUNT_SID            (AC...)
+// TWILIO_AUTH_TOKEN
+// RESEND_API_KEY
+// EMAIL_FROM                    (must be verified in Resend; use onboarding sender until verified)
+// EMAIL_TO
+
 const OPENAI_KEY = process.env.OPENAI_KEY;
 
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // https://...railway.app
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const RECORDING_WEBHOOK_SECRET = process.env.RECORDING_WEBHOOK_SECRET;
 
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID; // AC...
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const EMAIL_TO = process.env.EMAIL_TO;
 const EMAIL_FROM = process.env.EMAIL_FROM;
-const SMTP_HOST = process.env.SMTP_HOST;
-const SMTP_PORT = Number(process.env.SMTP_PORT || "587");
-const SMTP_USER = process.env.SMTP_USER;
-const SMTP_PASS = process.env.SMTP_PASS;
 
 const OWNER_NAME = process.env.OWNER_NAME || "Allen";
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "AI Phone Agent";
+
+// Use the model you confirmed is speaking
 const VOICE_MODEL =
   process.env.VOICE_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 
@@ -43,21 +51,6 @@ setInterval(() => {
     if (now - item.createdAt > RECORDING_TTL_MS) recordingStore.delete(token);
   }
 }, 60 * 60 * 1000).unref();
-
-// ------------ Email transport ------------
-function getMailer() {
-  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !EMAIL_FROM || !EMAIL_TO) return null;
-return nodemailer.createTransport({
-  host: SMTP_HOST,
-  port: SMTP_PORT,
-  secure: false, // STARTTLS
-  auth: { user: SMTP_USER, pass: SMTP_PASS },
-  tls: {
-    rejectUnauthorized: false,
-  },
-});
-
-}
 
 app.get("/", (req, res) => res.send("OK"));
 
@@ -73,10 +66,12 @@ app.get("/listen/:token", (req, res) => {
 // Twilio Voice webhook: starts recording + media stream
 app.post("/voice", (req, res) => {
   if (!PUBLIC_BASE_URL) return res.status(500).send("Missing PUBLIC_BASE_URL");
-  if (!RECORDING_WEBHOOK_SECRET) return res.status(500).send("Missing RECORDING_WEBHOOK_SECRET");
+  if (!RECORDING_WEBHOOK_SECRET)
+    return res.status(500).send("Missing RECORDING_WEBHOOK_SECRET");
 
-  const callbackUrl =
-    `${PUBLIC_BASE_URL}/recording-status?secret=${encodeURIComponent(RECORDING_WEBHOOK_SECRET)}`;
+  const callbackUrl = `${PUBLIC_BASE_URL}/recording-status?secret=${encodeURIComponent(
+    RECORDING_WEBHOOK_SECRET
+  )}`;
 
   const twiml = `
 <Response>
@@ -98,7 +93,7 @@ app.post("/voice", (req, res) => {
 
 // Twilio recording callback (fires after call ends and recording is ready)
 app.post("/recording-status", async (req, res) => {
-  // Always ACK quickly
+  // ACK immediately
   res.status(200).send("OK");
 
   try {
@@ -108,7 +103,6 @@ app.post("/recording-status", async (req, res) => {
       return;
     }
 
-    // Log EVERYTHING so we can see if callback is firing
     console.log("recording-status payload:", JSON.stringify(req.body, null, 2));
 
     const {
@@ -136,7 +130,9 @@ app.post("/recording-status", async (req, res) => {
       return;
     }
 
-    // Twilio lets you fetch as mp3 by appending .mp3
+    console.log("recording-status: starting download/transcribe/summarize/email...");
+
+    // Twilio recording download: append .mp3
     const mp3Url = `${RecordingUrl}.mp3`;
     const mp3 = await downloadWithTwilioAuth(mp3Url, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
@@ -160,7 +156,7 @@ app.post("/recording-status", async (req, res) => {
       meta: { CallSid, RecordingSid, RecordingDuration },
     });
 
-    console.log("recording-status: email sent for RecordingSid:", RecordingSid);
+    console.log("recording-status: Resend email sent for RecordingSid:", RecordingSid);
   } catch (err) {
     console.log("recording-status ERROR:", err?.stack || err?.message || err);
   }
@@ -206,7 +202,7 @@ ${transcript}`;
       model: "gpt-4o-mini",
       messages: [{ role: "user", content: prompt }],
       temperature: 0.2,
-      max_tokens: 600,
+      max_tokens: 650,
     }),
   });
 
@@ -216,9 +212,8 @@ ${transcript}`;
 }
 
 async function emailResults({ subject, transcript, summary, listenLink, meta }) {
-  const mailer = getMailer();
-  if (!mailer) {
-    console.log("Email not configured. Missing SMTP_* or EMAIL_* env vars.");
+  if (!RESEND_API_KEY || !EMAIL_TO || !EMAIL_FROM) {
+    console.log("Email not configured. Missing RESEND_API_KEY / EMAIL_TO / EMAIL_FROM.");
     return;
   }
 
@@ -240,12 +235,27 @@ Transcript:
 ${transcript}
 `.trim();
 
-  await mailer.sendMail({
-    from: EMAIL_FROM,
-    to: EMAIL_TO,
-    subject,
-    text: body,
+  const resp = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: EMAIL_FROM,
+      to: [EMAIL_TO],
+      subject,
+      text: body,
+    }),
   });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`Resend email failed ${resp.status}: ${errText}`);
+  }
+
+  const data = await resp.json();
+  console.log("Resend email sent:", data?.id || data);
 }
 
 // -------------------- Realtime Voice Bridge --------------------
@@ -262,17 +272,16 @@ wss.on("connection", (twilioWs) => {
 
   let streamSid = null;
 
-  // Track how much audio we’ve appended since last commit
-  // Twilio Media Streams commonly sends 20ms frames; we’ll assume 20ms per media event.
+  // Track appended audio since last commit
   let bufferedMs = 0;
 
-  // Prevent rapid repeat triggers
+  // Throttle repeated triggers
   let lastSpeechStoppedAt = 0;
 
-  // Track whether OpenAI is currently speaking/responding
+  // Track whether OpenAI is responding
   let responseInProgress = false;
 
-  // Queue audio output until streamSid exists
+  // Queue output audio until streamSid exists
   const outQueue = [];
   const MAX_OUT_QUEUE = 300;
 
@@ -344,7 +353,7 @@ You are a friendly, professional phone answering assistant for ${OWNER_NAME}.
       return;
     }
 
-    // Output audio
+    // Output audio deltas (support both names)
     const audioDelta =
       (msg.type === "response.audio.delta" && msg.delta) ||
       (msg.type === "response.output_audio.delta" && msg.delta);
@@ -354,29 +363,27 @@ You are a friendly, professional phone answering assistant for ${OWNER_NAME}.
     if (msg.type === "response.created") responseInProgress = true;
     if (msg.type === "response.done") responseInProgress = false;
 
-    // When caller stops talking, commit and ask for a response
+    // When caller stops talking, commit and respond
     if (msg.type === "input_audio_buffer.speech_stopped") {
       const now = Date.now();
 
-      // throttle repeated triggers
+      // Throttle repeated triggers
       if (now - lastSpeechStoppedAt < 400) return;
       lastSpeechStoppedAt = now;
 
-      // Don't do anything while model is still responding
+      // Don't trigger if model is still responding
       if (responseInProgress) return;
 
-      // Only commit if we have enough audio (>=100ms) to avoid commit_empty
-      if (bufferedMs < 100) {
-        // Not enough audio; just ignore this stop event.
-        return;
-      }
+      // Only commit if we buffered at least 100ms
+      if (bufferedMs < 100) return;
 
-      // Commit and request response
       wsSend(openaiWs, { type: "input_audio_buffer.commit" });
-      wsSend(openaiWs, { type: "response.create", response: { modalities: ["audio", "text"] } });
+      wsSend(openaiWs, {
+        type: "response.create",
+        response: { modalities: ["audio", "text"] },
+      });
       responseInProgress = true;
 
-      // Reset buffer counter after commit
       bufferedMs = 0;
     }
   });
@@ -384,7 +391,6 @@ You are a friendly, professional phone answering assistant for ${OWNER_NAME}.
   openaiWs.on("close", () => console.log("OpenAI WS closed"));
   openaiWs.on("error", (e) => console.log("OpenAI WS error:", e?.message || e));
 
-  // Twilio -> OpenAI
   twilioWs.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -404,11 +410,10 @@ You are a friendly, professional phone answering assistant for ${OWNER_NAME}.
       const payload = msg.media?.payload;
       if (!payload) return;
 
-      // Append audio to OpenAI input buffer
       wsSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
 
-      // Estimate buffered duration
-      bufferedMs += 20; // typical Twilio Media Stream frame
+      // Estimate buffered duration (Twilio typically sends ~20ms frames)
+      bufferedMs += 20;
       return;
     }
 
@@ -423,6 +428,7 @@ You are a friendly, professional phone answering assistant for ${OWNER_NAME}.
     try { openaiWs.close(); } catch {}
     try { twilioWs.close(); } catch {}
   };
+
   twilioWs.on("close", cleanup);
   twilioWs.on("error", cleanup);
 });

@@ -22,6 +22,10 @@ const PORT = process.env.PORT || 3000;
 // EMAIL_FROM                    (must be verified in Resend; use onboarding sender until verified)
 // EMAIL_TO
 //
+// Option 2 routing (Twilio rings your landline first, then AI):
+// LANDLINE_NUMBER               (e.g. +14045551234)
+// LANDLINE_RING_SECONDS         (e.g. 15)
+//
 // Optional:
 // OWNER_NAME
 // BUSINESS_NAME
@@ -41,6 +45,10 @@ const EMAIL_FROM = process.env.EMAIL_FROM;
 
 const OWNER_NAME = process.env.OWNER_NAME || "Allen";
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "Gambrell Photography";
+
+// Option 2 vars
+const LANDLINE_NUMBER = process.env.LANDLINE_NUMBER || ""; // must be E.164, e.g. +1404...
+const LANDLINE_RING_SECONDS = Number(process.env.LANDLINE_RING_SECONDS || "15");
 
 // Use the model you confirmed is speaking
 const VOICE_MODEL =
@@ -72,16 +80,26 @@ app.get("/listen/:token", (req, res) => {
   res.send(item.mp3);
 });
 
-// Twilio Voice webhook: starts recording + media stream
+// Twilio Voice webhook: starts recording + rings landline first + AI fallback
 app.post("/voice", (req, res) => {
   if (!PUBLIC_BASE_URL) return res.status(500).send("Missing PUBLIC_BASE_URL");
   if (!RECORDING_WEBHOOK_SECRET)
     return res.status(500).send("Missing RECORDING_WEBHOOK_SECRET");
+  if (!LANDLINE_NUMBER)
+    return res
+      .status(500)
+      .send("Missing LANDLINE_NUMBER (must be +1... E.164 format)");
 
   const callbackUrl = `${PUBLIC_BASE_URL}/recording-status?secret=${encodeURIComponent(
     RECORDING_WEBHOOK_SECRET
   )}`;
 
+  // Validate timeout (Twilio expects integer seconds)
+  const timeout = Number.isFinite(LANDLINE_RING_SECONDS) && LANDLINE_RING_SECONDS > 0
+    ? Math.floor(LANDLINE_RING_SECONDS)
+    : 15;
+
+  // Option 2: Ring landline first. If not answered (or busy/failed), TwiML continues to AI stream.
   const twiml = `
 <Response>
   <Start>
@@ -92,6 +110,10 @@ app.post("/voice", (req, res) => {
       recordingStatusCallbackEvent="completed"
     />
   </Start>
+
+  <Dial timeout="${timeout}">${LANDLINE_NUMBER}</Dial>
+
+  <!-- If no answer, run the AI agent -->
   <Connect>
     <Stream url="wss://${req.headers.host}/media"/>
   </Connect>
@@ -141,7 +163,9 @@ app.post("/recording-status", async (req, res) => {
       return;
     }
 
-    console.log("recording-status: starting download/transcribe/summarize/email...");
+    console.log(
+      "recording-status: starting download/transcribe/summarize/email..."
+    );
 
     // Twilio recording download: append .mp3
     const mp3Url = `${RecordingUrl}.mp3`;
@@ -293,7 +317,9 @@ ${transcript}
 }
 
 // -------------------- Realtime Voice Bridge --------------------
-const server = app.listen(PORT, () => console.log("Server running on port", PORT));
+const server = app.listen(PORT, () =>
+  console.log("Server running on port", PORT)
+);
 const wss = new WebSocket.Server({ server, path: "/media" });
 
 function wsSend(ws, obj) {
@@ -349,7 +375,9 @@ wss.on("connection", (twilioWs) => {
 
   if (!OPENAI_KEY) {
     console.log("Missing OPENAI_KEY; closing stream.");
-    try { twilioWs.close(); } catch {}
+    try {
+      twilioWs.close();
+    } catch {}
     return;
   }
 
@@ -414,7 +442,9 @@ Rules:
     // If OpenAI detects the caller started speaking, barge-in cancel
     if (msg.type === "input_audio_buffer.speech_started") {
       if (responseInProgress) {
-        console.log("Barge-in: caller started speaking; cancelling assistant response");
+        console.log(
+          "Barge-in: caller started speaking; cancelling assistant response"
+        );
         interruptAssistant(openaiWs);
       }
     }
@@ -482,7 +512,9 @@ Rules:
 
       // If caller audio arrives while assistant is talking, barge-in immediately
       if (responseInProgress) {
-        console.log("Barge-in: media received while assistant speaking; cancelling response");
+        console.log(
+          "Barge-in: media received while assistant speaking; cancelling response"
+        );
         interruptAssistant(openaiWs);
       }
 
@@ -495,14 +527,22 @@ Rules:
 
     if (msg.event === "stop") {
       console.log("Twilio stream stop");
-      try { openaiWs.close(); } catch {}
-      try { twilioWs.close(); } catch {}
+      try {
+        openaiWs.close();
+      } catch {}
+      try {
+        twilioWs.close();
+      } catch {}
     }
   });
 
   const cleanup = () => {
-    try { openaiWs.close(); } catch {}
-    try { twilioWs.close(); } catch {}
+    try {
+      openaiWs.close();
+    } catch {}
+    try {
+      twilioWs.close();
+    } catch {}
   };
 
   twilioWs.on("close", cleanup);

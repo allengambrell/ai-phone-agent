@@ -1,7 +1,6 @@
-﻿// server.js
-const express = require("express");
+﻿const express = require("express");
 const bodyParser = require("body-parser");
-const WebSocket = require("ws");
+const crypto = require("crypto");
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -9,189 +8,172 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 
+const OPENAI_KEY = process.env.OPENAI_KEY;
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // e.g. https://ai-phone-agent-production-b8a9.up.railway.app
+const VOICE_NAME = process.env.VOICE_NAME || "alloy";
+
+const OWNER_NAME = process.env.OWNER_NAME || "Allen";
+const BUSINESS_NAME = process.env.BUSINESS_NAME || "our office";
+const FORWARD_TO = process.env.FORWARD_TO || "";
+
+// In-memory storage for generated audio (mp3 bytes)
+const audioStore = new Map(); // id -> { buf, contentType, createdAt }
+const AUDIO_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function cleanupAudioStore() {
+  const now = Date.now();
+  for (const [id, item] of audioStore.entries()) {
+    if (now - item.createdAt > AUDIO_TTL_MS) audioStore.delete(id);
+  }
+}
+setInterval(cleanupAudioStore, 60 * 1000).unref();
+
+const callState = new Map(); // CallSid -> { history: [{role, content}] }
+
 app.get("/", (req, res) => res.send("OK"));
 
-// Twilio Voice webhook -> starts Media Stream
-app.post("/voice", (req, res) => {
+// Serve generated audio to Twilio <Play>
+app.get("/audio/:id", (req, res) => {
+  const item = audioStore.get(req.params.id);
+  if (!item) return res.status(404).send("Not found");
+  res.setHeader("Content-Type", item.contentType);
+  res.send(item.buf);
+});
+
+// Twilio entry
+app.post("/voice", async (req, res) => {
+  const callSid = req.body.CallSid;
+  if (callSid && !callState.has(callSid)) callState.set(callSid, { history: [] });
+
+  const greetingText = `Thanks for calling ${BUSINESS_NAME}. How can I help you today?`;
+
+  const greetingUrl = await ttsToUrl(greetingText);
+
   const twiml = `
 <Response>
-  <Connect>
-    <Stream url="wss://${req.headers.host}/media"/>
-  </Connect>
+  <Play>${greetingUrl}</Play>
+  <Gather input="speech" action="/gather" method="POST" speechTimeout="auto">
+    <Say>Please tell me how I can help.</Say>
+  </Gather>
+  <Say>Sorry, I didn't catch that.</Say>
+  <Redirect method="POST">/voice</Redirect>
 </Response>`;
   res.type("text/xml").send(twiml);
 });
 
-const server = app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
+app.post("/gather", async (req, res) => {
+  const callSid = req.body.CallSid;
+  const speech = (req.body.SpeechResult || "").trim();
 
-const wss = new WebSocket.Server({ server, path: "/media" });
+  const state = callState.get(callSid) || { history: [] };
+  callState.set(callSid, state);
 
-function safeSend(ws, obj) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(typeof obj === "string" ? obj : JSON.stringify(obj));
-}
-
-wss.on("connection", (twilioWs) => {
-  console.log("Twilio connected");
-
-  let streamSid = null;
-
-  // Buffer OpenAI audio until we have streamSid
-  const twilioOutbox = [];
-  const MAX_TWILIO_OUTBOX = 200;
-
-  function sendToTwilioMedia(base64Mulaw) {
-    if (!base64Mulaw) return;
-    if (!streamSid) {
-      twilioOutbox.push(base64Mulaw);
-      if (twilioOutbox.length > MAX_TWILIO_OUTBOX) twilioOutbox.shift();
-      return;
-    }
-    safeSend(twilioWs, {
-      event: "media",
-      streamSid,
-      media: { payload: base64Mulaw },
-    });
+  if (!speech) {
+    return res.type("text/xml").send(`
+<Response>
+  <Gather input="speech" action="/gather" method="POST" speechTimeout="auto">
+    <Say>Please tell me how I can help.</Say>
+  </Gather>
+  <Redirect method="POST">/voice</Redirect>
+</Response>`);
   }
 
-  const openaiWs = new WebSocket(
-    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_KEY}`,
-        "OpenAI-Beta": "realtime=v1",
-      },
-    }
-  );
+  // Transfer intent (optional)
+  const wantsTransfer =
+    new RegExp(`\\b(${OWNER_NAME}|owner|transfer|forward|speak to|talk to)\\b`, "i").test(speech);
 
-  openaiWs.on("open", () => {
-    console.log("OpenAI realtime connected");
+  if (wantsTransfer && FORWARD_TO) {
+    const twiml = `
+<Response>
+  <Say>One moment please. I'll connect you.</Say>
+  <Dial>${FORWARD_TO}</Dial>
+  <Say>I couldn't connect you. I can take a message.</Say>
+  <Gather input="speech" action="/gather" method="POST" speechTimeout="auto"/>
+</Response>`;
+    return res.type("text/xml").send(twiml);
+  }
 
-    // Keep session.update minimal + correct for Twilio PSTN audio (mulaw/8k)
-    safeSend(openaiWs, {
-      type: "session.update",
-      session: {
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-        voice: "alloy",
-        instructions:
-          "You are a friendly phone answering assistant for Allen. Speak clearly and be brief.",
-      },
-    });
+  state.history.push({ role: "user", content: speech });
 
-    // Force a greeting. Some realtime variants won’t speak unless instructions are on response.create.
-    safeSend(openaiWs, {
-      type: "response.create",
-      response: {
-        modalities: ["audio", "text"],
-        instructions:
-          "Start the call with a friendly greeting and ask how you can help.",
-      },
-    });
-  });
+  let reply = "";
+  try {
+    reply = await chatReply(state.history);
+  } catch (e) {
+    reply = "I'm having trouble right now. Please leave your name, number, and reason for calling.";
+  }
 
-  openaiWs.on("message", (data) => {
-    let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch {
-      console.log("OpenAI non-JSON message");
-      return;
-    }
+  state.history.push({ role: "assistant", content: reply });
 
-    // Log errors fully (this is critical)
-    if (msg.type === "error") {
-      console.log("OpenAI ERROR:", JSON.stringify(msg, null, 2));
-      return;
-    }
+  const replyUrl = await ttsToUrl(reply);
 
-    // Helpful: log important lifecycle events
-    if (
-      msg.type &&
-      ![
-        "response.audio.delta",
-        "response.output_audio.delta",
-        "response.audio",
-        "response.output_audio",
-        "response.output_text.delta",
-      ].includes(msg.type)
-    ) {
-      if (msg.type.includes("session") || msg.type.includes("response")) {
-        console.log("OpenAI event:", msg.type);
-      }
-    }
-
-    // Different accounts/models emit different event names for audio deltas.
-    // Support multiple possibilities.
-    let audioDelta = null;
-
-    if (msg.type === "response.audio.delta" && msg.delta) audioDelta = msg.delta;
-    if (msg.type === "response.output_audio.delta" && msg.delta) audioDelta = msg.delta;
-    if (msg.type === "response.audio" && msg.audio) audioDelta = msg.audio;
-    if (msg.type === "response.output_audio" && msg.audio) audioDelta = msg.audio;
-
-    if (audioDelta) {
-      sendToTwilioMedia(audioDelta);
-    }
-
-    // If OpenAI finishes but never sent audio, we’ll know.
-    if (msg.type === "response.done") {
-      console.log("OpenAI response.done");
-    }
-  });
-
-  openaiWs.on("close", () => console.log("OpenAI WS closed"));
-  openaiWs.on("error", (e) => console.log("OpenAI WS error:", e?.message || e));
-
-  // From Twilio -> to OpenAI
-  twilioWs.on("message", (data) => {
-    let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch {
-      return;
-    }
-
-    if (msg.event === "start") {
-      streamSid = msg.start?.streamSid;
-      console.log("Stream started:", streamSid);
-
-      // Flush any buffered OpenAI audio that arrived before streamSid
-      while (twilioOutbox.length) {
-        const b64 = twilioOutbox.shift();
-        safeSend(twilioWs, {
-          event: "media",
-          streamSid,
-          media: { payload: b64 },
-        });
-      }
-      return;
-    }
-
-    if (msg.event === "media") {
-      const payload = msg.media?.payload;
-      if (!payload) return;
-
-      safeSend(openaiWs, {
-        type: "input_audio_buffer.append",
-        audio: payload,
-      });
-      return;
-    }
-
-    if (msg.event === "stop") {
-      console.log("Twilio stream stop");
-      try { openaiWs.close(); } catch {}
-      try { twilioWs.close(); } catch {}
-    }
-  });
-
-  twilioWs.on("close", () => {
-    try { openaiWs.close(); } catch {}
-  });
-  twilioWs.on("error", () => {
-    try { openaiWs.close(); } catch {}
-  });
+  const twiml = `
+<Response>
+  <Play>${replyUrl}</Play>
+  <Gather input="speech" action="/gather" method="POST" speechTimeout="auto">
+    <Say>Anything else?</Say>
+  </Gather>
+  <Say>Okay. Goodbye.</Say>
+  <Hangup/>
+</Response>`;
+  res.type("text/xml").send(twiml);
 });
+
+async function chatReply(history) {
+  if (!OPENAI_KEY) throw new Error("Missing OPENAI_KEY");
+
+  const system = {
+    role: "system",
+    content: `You are a professional phone answering assistant for ${OWNER_NAME} at ${BUSINESS_NAME}.
+Be friendly and concise (1–3 sentences). If unsure, take a message.
+Always try to collect caller name, callback number, and reason for calling.
+Never invent prices or policies.`,
+  };
+
+  const messages = [system, ...history.slice(-12)];
+
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages,
+      temperature: 0.4,
+      max_tokens: 180,
+    }),
+  });
+
+  if (!resp.ok) throw new Error(await resp.text());
+  const data = await resp.json();
+  return (data.choices?.[0]?.message?.content || "").trim() || "How can I help?";
+}
+
+async function ttsToUrl(text) {
+  if (!OPENAI_KEY) throw new Error("Missing OPENAI_KEY");
+  if (!PUBLIC_BASE_URL) throw new Error("Missing PUBLIC_BASE_URL");
+
+  const id = crypto.randomBytes(16).toString("hex");
+
+  // OpenAI TTS: returns audio bytes (mp3)
+  const resp = await fetch("https://api.openai.com/v1/audio/speech", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini-tts",
+      voice: VOICE_NAME,
+      format: "mp3",
+      input: text,
+    }),
+  });
+
+  if (!resp.ok) throw new Error(await resp.text());
+
+  const buf = Buffer.from(await resp.arrayBuffer());
+  audioStore.set(id, { buf, contentType: "audio/mpeg", createdAt: Date.now() });
+
+  return `${PUBLIC_BASE_URL}/audio/${id}`;
+}
+
+app.listen(PORT, () => console.log("Server running on port", PORT));

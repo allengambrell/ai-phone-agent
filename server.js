@@ -8,133 +8,153 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ====== CONFIG YOU SET IN RAILWAY VARIABLES ======
-// OPENAI_KEY      = sk-...
-// FORWARD_TO      = +1YourCellNumber (optional; for call transfer)
-// BUSINESS_NAME   = Allen's Office   (optional)
-// OWNER_NAME      = Allen           (optional)
+// ==============================
+// Railway Environment Variables
+// ==============================
+// OPENAI_KEY   = sk-xxxxxxxxxxxxxxxx
+// OWNER_NAME  = Allen
+// BUSINESS_NAME = Allen's Office
+// FORWARD_TO  = +15551234567   (optional)
 
-const BUSINESS_NAME = process.env.BUSINESS_NAME || "our office";
 const OWNER_NAME = process.env.OWNER_NAME || "Allen";
-const FORWARD_TO = process.env.FORWARD_TO || ""; // e.g. +15551234567
+const BUSINESS_NAME = process.env.BUSINESS_NAME || "our office";
+const FORWARD_TO = process.env.FORWARD_TO || "";
 
-// In-memory call context (good enough to start; later we can persist)
-const callState = new Map(); // CallSid -> { history: [{role,content}], startedAt }
+// Simple in-memory conversation memory per call
+const callState = new Map();
 
+// ------------------------------
 app.get("/", (req, res) => res.send("OK"));
+// ------------------------------
 
-// ---------- Twilio entrypoint ----------
+
+// ============
+// ENTRY POINT
+// ============
 app.post("/voice", (req, res) => {
   const callSid = req.body.CallSid;
 
-  if (callSid && !callState.has(callSid)) {
-    callState.set(callSid, { history: [], startedAt: Date.now() });
+  if (!callState.has(callSid)) {
+    callState.set(callSid, { history: [] });
   }
 
   const twiml = `
 <Response>
-  <Say>Thanks for calling ${BUSINESS_NAME}. This call may be recorded.</Say>
-  <Gather input="speech" action="/gather" method="POST" speechTimeout="auto">
-    <Say>How can I help you today?</Say>
+  <Say voice="alice">
+    Thank you for calling ${BUSINESS_NAME}. How can I help you today?
+  </Say>
+
+  <Gather input="speech"
+          action="/gather"
+          method="POST"
+          speechTimeout="auto">
+
+    <Say voice="alice">Please tell me how I can help.</Say>
   </Gather>
-  <Say>Sorry, I didn't catch that.</Say>
-  <Redirect method="POST">/voice</Redirect>
+
+  <Say voice="alice">Sorry, I didn't catch that.</Say>
+  <Redirect>/voice</Redirect>
 </Response>`;
 
   res.type("text/xml").send(twiml);
 });
 
-// ---------- Handle speech input ----------
+
+// =====================
+// HANDLE SPEECH RESULT
+// =====================
 app.post("/gather", async (req, res) => {
   const callSid = req.body.CallSid;
   const speech = (req.body.SpeechResult || "").trim();
 
-  const state = callState.get(callSid) || { history: [], startedAt: Date.now() };
+  const state = callState.get(callSid) || { history: [] };
   callState.set(callSid, state);
 
-  // If Twilio didn't capture speech, reprompt
   if (!speech) {
-    const twiml = `
-<Response>
-  <Gather input="speech" action="/gather" method="POST" speechTimeout="auto">
-    <Say>I didn’t hear anything. Please tell me how I can help.</Say>
-  </Gather>
-  <Redirect method="POST">/voice</Redirect>
-</Response>`;
-    res.type("text/xml").send(twiml);
-    return;
+    return reprompt(res);
   }
 
-  // Simple “transfer” intent (we can refine later)
-  const wantsOwner =
-    /\b(owner|${OWNER_NAME.toLowerCase()}|talk to|speak to|transfer|forward)\b/i.test(speech);
+  // Detect transfer request
+  const wantsTransfer =
+    new RegExp(`\\b(${OWNER_NAME}|owner|transfer|forward|speak to|talk to)\\b`, "i")
+      .test(speech);
 
-  if (wantsOwner && FORWARD_TO) {
+  if (wantsTransfer && FORWARD_TO) {
     const twiml = `
 <Response>
-  <Say>One moment please. I’ll connect you.</Say>
-  <Dial callerId="${req.body.To || ""}">${FORWARD_TO}</Dial>
-  <Say>Sorry, I couldn’t connect you. I can take a message.</Say>
-  <Gather input="speech" action="/gather" method="POST" speechTimeout="auto">
-    <Say>Please leave your name, number, and reason for calling.</Say>
-  </Gather>
+  <Say voice="alice">One moment please. I'll connect you.</Say>
+  <Dial>${FORWARD_TO}</Dial>
+
+  <Say voice="alice">
+    I couldn't connect you. Please leave your name, number, and reason for calling.
+  </Say>
+
+  <Gather input="speech"
+          action="/gather"
+          method="POST"
+          speechTimeout="auto"/>
 </Response>`;
-    res.type("text/xml").send(twiml);
-    return;
+
+    return res.type("text/xml").send(twiml);
   }
 
-  // Add caller message to state
   state.history.push({ role: "user", content: speech });
 
-  // Ask OpenAI for the next reply
-  let replyText = "";
+  let reply;
   try {
-    replyText = await callOpenAI(state.history);
-  } catch (e) {
-    replyText = "Sorry — I’m having trouble right now. Please leave your name, number, and a short message.";
+    reply = await askOpenAI(state.history);
+  } catch {
+    reply = "I'm having trouble right now. Please leave your name, number, and reason for calling.";
   }
 
-  // Add assistant reply to state
-  state.history.push({ role: "assistant", content: replyText });
+  state.history.push({ role: "assistant", content: reply });
 
-  // Respond to caller + continue the conversation loop
   const twiml = `
 <Response>
-  <Say>${escapeXmlForTwiml(replyText)}</Say>
-  <Gather input="speech" action="/gather" method="POST" speechTimeout="auto">
-    <Say>Anything else I can help with?</Say>
+  <Say voice="alice">${escapeXml(reply)}</Say>
+
+  <Gather input="speech"
+          action="/gather"
+          method="POST"
+          speechTimeout="auto">
+
+    <Say voice="alice">Anything else I can help with?</Say>
   </Gather>
-  <Say>Okay. Goodbye.</Say>
+
+  <Say voice="alice">Okay. Goodbye.</Say>
   <Hangup/>
 </Response>`;
 
   res.type("text/xml").send(twiml);
 });
 
-// ---------- OpenAI call (text) ----------
-async function callOpenAI(history) {
-  const OPENAI_KEY = process.env.OPENAI_KEY;
-  if (!OPENAI_KEY) throw new Error("Missing OPENAI_KEY");
 
-  // Build a compact prompt: system + recent history
-  const system = {
+// =================
+// OPENAI TEXT CALL
+// =================
+async function askOpenAI(history) {
+  const systemPrompt = {
     role: "system",
-    content:
-      `You are a professional phone answering assistant for ${OWNER_NAME} at ${BUSINESS_NAME}.
+    content: `
+You are a professional phone answering assistant for ${OWNER_NAME}.
+
 Rules:
-- Be concise and friendly (1–3 short sentences).
-- If you don’t know, say you will take a message.
-- Always try to collect: caller name, callback number, and reason for calling.
-- If asked to speak to ${OWNER_NAME}, say you'll connect them if possible; otherwise offer to take a message.
-- Do NOT invent business policies or prices.`,
+- Be friendly and concise (1–3 sentences).
+- If unsure, take a message.
+- Always try to collect:
+  caller name,
+  callback number,
+  reason for calling.
+- Never invent prices or policies.
+`
   };
 
-  const messages = [system, ...history.slice(-12)];
+  const messages = [systemPrompt, ...history.slice(-12)];
 
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${OPENAI_KEY}`,
+      Authorization: `Bearer ${process.env.OPENAI_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -145,17 +165,36 @@ Rules:
     }),
   });
 
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`OpenAI error ${resp.status}: ${text}`);
+  if (!response.ok) {
+    throw new Error("OpenAI API error");
   }
 
-  const data = await resp.json();
-  return (data.choices?.[0]?.message?.content || "").trim() || "How can I help?";
+  const data = await response.json();
+  return data.choices[0].message.content.trim();
 }
 
-function escapeXmlForTwiml(s) {
-  return String(s)
+
+// =================
+function reprompt(res) {
+  const twiml = `
+<Response>
+  <Gather input="speech"
+          action="/gather"
+          method="POST"
+          speechTimeout="auto">
+    <Say voice="alice">Please tell me how I can help.</Say>
+  </Gather>
+  <Redirect>/voice</Redirect>
+</Response>`;
+  res.type("text/xml").send(twiml);
+}
+
+
+// ===============
+// XML ESCAPING
+// ===============
+function escapeXml(str) {
+  return String(str)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -163,4 +202,8 @@ function escapeXmlForTwiml(s) {
     .replace(/'/g, "&apos;");
 }
 
-app.listen(PORT, () => console.log("Server running on port", PORT));
+
+// ============
+app.listen(PORT, () => {
+  console.log("Server running on port", PORT);
+});
